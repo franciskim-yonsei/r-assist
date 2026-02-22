@@ -22,16 +22,6 @@ description: Trigger for prompts where correctness depends on user's live RStudi
 5.  Execute analysis incrementally in that same background R session, one short command per step.
 6.  If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
 
-## Simplicity-first execution
-
--   Strongly prefer many simple lines over one dense line.
--   Keep one action per line in both `--append-code` and background R commands.
--   Avoid semicolon chains and deeply nested expressions.
--   Avoid long all-in-one constructors like giant `list(...)` or heavy inline indexing in one command.
--   Build intermediate objects with explicit names, then check each object before the next step.
--   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
--   Never retry by making the same command more complex. Retry by splitting it into smaller steps.
-
 ## Capabilities
 
 ### Quick reference
@@ -61,7 +51,7 @@ description: Trigger for prompts where correctness depends on user's live RStudi
 
 Use for one final read-only expression.
 
--   Only one single-line expression, no assignments.
+-   Only one single-line expression, no assignments (`<-` prohibited!).
 -   Multi-step prep goes in `APPEND_CODE`.
 
 Example:
@@ -172,18 +162,24 @@ Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 -   Treat tool `yield_time_ms` as output polling only, not process cancellation. Do not stack retries while a prior wrapper call is still running.
 -   Prefer live runtime env vars (`RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, `RSTUDIO_SESSION_PID`) when present. Do not blindly overwrite them with `suspended-session-data/environment_vars`, which may be stale.
 
-### Code-generation check
+### Hard code requirements
 
 Run these checks before every invocation.
 
--   Reject complex one-liner construction when equivalent simple line-by-line commands exist.
--   Reject semicolon-separated multi-statement lines.
--   Prefer explicit intermediate variables and short commands that are easy to debug.
 -   Reject `<<-`, `->>`, global `assign(...)`, global `rm/remove(...)`, and `source(..., local = FALSE)`.
 -   Reject `save`, `saveRDS`, `load`, and file-creation calls in live-session calls.
 -   Reject `setwd`, `options`, `Sys.setenv`, `attach`, `detach`, `sink`, `system`, `system2`, `q`, `quit`.
 -   Keep `library()`/`require()` out of live-session calls unless explicitly requested by user intent.
 -   For graphical commands in live-session calls, enforce `print(...)` around rendering expressions.
+
+### Highly recommended: keep it simple.
+
+-   Avoid complex one-liner construction like giant `list(...)` or heavy inline indexing in one command.
+-   Avoid semicolon-separated multi-statement lines and deeply nested expressions.
+-   Strongly prefer explicit intermediate variables and short commands that are easy to debug.
+-   Keep one action per line in both `--append-code` and background R commands.
+-   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
+-   Never retry by making the same command more complex. Retry by splitting it into smaller steps.
 
 ### Other rules
 
@@ -191,7 +187,6 @@ Run these checks before every invocation.
 -   Runtime R errors must be surfaced as `__ERROR__:<message>` in the result payload, never as indefinite waits.
 -   Prefer one live wrapper call to capture state and one live wrapper call to render final result for experimentation tasks.
 -   Avoid sending candidate-by-candidate updates to live RStudio unless the user explicitly asks for that interaction style.
--   In background R, send one command at a time and wait for its result before sending the next command.
 
 ## Troubleshooting
 
