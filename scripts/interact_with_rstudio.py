@@ -898,9 +898,35 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
         r_create_lines.append(f'assign("{name}", {tmp_name}, envir = .GlobalEnv)')
         r_create_lines.append(f'rm({tmp_name})')
 
-    for snippet in state.modify_global_snippets:
-        escaped = escape_for_r_string(snippet)
-        r_modify_lines.append(f'eval(parse(text = "{escaped}"), envir = .GlobalEnv)')
+    if state.modify_global_snippets:
+        # Make scratch results visible to MODIFY snippets while still mutating .GlobalEnv.
+        # We only inject names that do not already exist globally and clean them up on exit.
+        r_modify_lines.append(
+            ".codex_exec_names_for_modify <- ls(envir = .codex_exec_env, all.names = TRUE)"
+        )
+        r_modify_lines.append(
+            ".codex_global_names_for_modify <- ls(envir = .GlobalEnv, all.names = TRUE)"
+        )
+        r_modify_lines.append(
+            ".codex_injected_names_for_modify <- setdiff(.codex_exec_names_for_modify, .codex_global_names_for_modify)"
+        )
+        r_modify_lines.append("if (length(.codex_injected_names_for_modify) > 0L) {")
+        r_modify_lines.append("  for (.codex_tmp_nm in .codex_injected_names_for_modify) {")
+        r_modify_lines.append(
+            "    assign(.codex_tmp_nm, get(.codex_tmp_nm, envir = .codex_exec_env, inherits = FALSE), envir = .GlobalEnv)"
+        )
+        r_modify_lines.append("  }")
+        r_modify_lines.append("}")
+        r_modify_lines.append("on.exit({")
+        r_modify_lines.append(
+            "  if (exists(\".codex_injected_names_for_modify\", inherits = FALSE) && length(.codex_injected_names_for_modify) > 0L) {"
+        )
+        r_modify_lines.append("    rm(list = .codex_injected_names_for_modify, envir = .GlobalEnv)")
+        r_modify_lines.append("  }")
+        r_modify_lines.append("}, add = TRUE)")
+        for snippet in state.modify_global_snippets:
+            escaped = escape_for_r_string(snippet)
+            r_modify_lines.append(f'eval(parse(text = "{escaped}"), envir = .GlobalEnv)')
 
     r_exec_block = join_lines(r_exec_lines)
     r_create_block = join_lines(r_create_lines)
