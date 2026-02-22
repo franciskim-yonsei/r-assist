@@ -882,16 +882,20 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
         r_exec_lines.append('.codex_result_expr <- .codex_state_export_path')
 
     seen = set()
-    for spec in state.create_global_specs:
+    for create_idx, spec in enumerate(state.create_global_specs, start=1):
         name, expr = validate_name_expr_spec(spec, "create")
         if name in seen:
             raise ValidationError(f"create duplicates name '{name}' in one invocation.")
         seen.add(name)
+        tmp_name = f".codex_create_value_{create_idx}"
         r_create_lines.append(
             f'if (exists("{name}", envir = .GlobalEnv, inherits = FALSE)) stop("CREATE_NEW_GLOBAL_VARIABLE refused: \'{name}\' already exists in .GlobalEnv")'
         )
-        r_create_lines.append(f'{name} <- ({expr})')
-        r_create_lines.append(f'assign("{name}", {name}, envir = .GlobalEnv)')
+        r_create_lines.append(
+            f'{tmp_name} <- eval(quote(({expr})), envir = .codex_exec_env)'
+        )
+        r_create_lines.append(f'assign("{name}", {tmp_name}, envir = .GlobalEnv)')
+        r_create_lines.append(f'rm({tmp_name})')
 
     for snippet in state.modify_global_snippets:
         escaped = escape_for_r_string(snippet)
@@ -913,7 +917,8 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
     r_code += '.codex_result_written <- FALSE\n'
     r_code += '.codex_exec_result <- NULL\n'
     r_code += '.codex_run_core <- function() {\n'
-    r_code += '  .codex_exec_result <<- with(new.env(parent = .GlobalEnv), {\n'
+    r_code += '  .codex_exec_env <- new.env(parent = .GlobalEnv)\n'
+    r_code += '  .codex_exec_result <<- with(.codex_exec_env, {\n'
     r_code += indent_block(r_exec_block, "    ")
     r_code += '  })\n'
     if r_create_block:
