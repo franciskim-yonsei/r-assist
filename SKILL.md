@@ -1,5 +1,5 @@
 ---
-name: rstudio-talk
+name: r-assist
 description: Trigger for R prompts where correctness depends on inspecting the user's live RStudio session state. Use when a prompt references concrete in-session objects/expressions and asks what currently exists (values, levels, labels, fields, dimensions), what a concrete expression currently returns, or why a concrete runtime call fails (including plotting/debugging issues such as Seurat::DimPlot behavior). Treat R-domain cues (syntax, operators, package/function names) as supporting evidence, not sufficient alone. Prefer false positives over false negatives when uncertain. Skip only conceptual/stateless R questions or meta discussion about this skill.
 ---
 

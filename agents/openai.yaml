@@ -1,4 +1,4 @@
 interface:
   display_name: "Talk to Rstudio"
   short_description: "Execute code in active RStudio sessions via RPC"
-  default_prompt: "Use $rstudio-talk by selecting the least-permissive communication mode (INSPECT, EXPLORE, MODIFY) as the primary decision. Treat capability details as under construction TODOs and follow mode constraints as the source of truth."
+  default_prompt: "Use $r-assist by selecting the least-permissive communication mode (INSPECT, EXPLORE, MODIFY) as the primary decision. Treat capability details as under construction TODOs and follow mode constraints as the source of truth."
