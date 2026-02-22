@@ -7,19 +7,30 @@ description: Trigger for prompts where correctness depends on user's live RStudi
 
 ## Overview
 
--   Primary source of truth is the live RStudio session via `scripts/interact_with_rstudio.sh` (expanded to absolute path).
--   Use your capabilities build a call to the wrapper script that will interrogate the live Rstudio session.
--   Export live session state and continue in a background R session for iterative exploration or experimentation.
+-   Interrogate live RStudio session via `bash SKILL_DIR/scripts/interact_with_rstudio.sh` (where `SKILL_DIR` refers to the directory containing this `SKILL.md` file).
+-   Use your capabilities build a call to the wrapper script that will directly send code to the live Rstudio console.
+-   Export only minimal live session state, then continue in one persistent background R terminal with short, line-by-line commands.
 
 ## Workflow
 
 1.  Identify the minimum objects/functions needed from live RStudio.
 2.  Classify the task:
     -   One-shot read/check: send code directly to the live console to avoid expensive exports.
-    -   Experimentation/comparison/tuning: use `R_STATE_EXPORT` once, then continue in background R, to minimize console pollution and accidental user-facing side effects.
+    -   Experimentation/comparison/tuning: use `R_STATE_EXPORT` once, then continue in one persistent background R session, to minimize console pollution and accidental user-facing side effects.
 3.  Choose payload shape to minimize serialization cost (fewest objects possible).
-4.  Perform iterative work in background R.
-5.  If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
+4.  Start one background R terminal and keep it open (`R --quiet --no-save`).
+5.  Execute analysis incrementally in that same background R session, one short command per step.
+6.  If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
+
+## Simplicity-first execution
+
+-   Strongly prefer many simple lines over one dense line.
+-   Keep one action per line in both `--append-code` and background R commands.
+-   Avoid semicolon chains and deeply nested expressions.
+-   Avoid long all-in-one constructors like giant `list(...)` or heavy inline indexing in one command.
+-   Build intermediate objects with explicit names, then check each object before the next step.
+-   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
+-   Never retry by making the same command more complex. Retry by splitting it into smaller steps.
 
 ## Capabilities
 
@@ -56,7 +67,7 @@ Use for one final read-only expression.
 Example:
 
 ``` bash
-bash scripts/interact_with_rstudio.sh \
+bash SKILL_DIR/scripts/interact_with_rstudio.sh \
   --set-result-expr 'class(project_obj$sample_01)'
 ```
 
@@ -68,9 +79,10 @@ Use for temporary setup and single-shot probing.
 -   Avoid repeated console interactions for iterative debugging.
 -   Do not run exploratory loops that emit many plots in live RStudio by default.
 -   For plot-selection tasks, reserve live `print(...)` for the final selected plot unless user explicitly requests live comparisons.
+-   Prefer multiple simple `--append-code` lines rather than one complex `--append-code` expression.
 
 ``` bash
-bash scripts/interact_with_rstudio.sh \
+bash SKILL_DIR/scripts/interact_with_rstudio.sh \
   --append-code 'obj <- project_obj$sample_01' \
   --append-code 'plot_obj <- Seurat::DimPlot(obj)' \
   --set-result-expr 'head(plot_obj$data$colour)'
@@ -79,7 +91,7 @@ bash scripts/interact_with_rstudio.sh \
 Special example: when plots must be visible to the user, make sure to use `print(...)` around calls that return plot objects (ggplot2/patchwork/Seurat plot builders).
 
 ``` bash
-bash scripts/interact_with_rstudio.sh \
+bash SKILL_DIR/scripts/interact_with_rstudio.sh \
   --append-code 'obj <- otic[[4]]' \
   --append-code 'print(Seurat::DimPlot(obj, reduction = "umap.rna"))'
 ```
@@ -99,22 +111,30 @@ Use when follow-up is likely.
     -   `--timeout` at least `est_seconds + 60`.
 6.  Run `--r-state-export` once approved.
 7.  Script returns a path to the exported RDS.
-8.  Open background R and load with `readRDS()`.
-9.  Iterate there for follow-up calls.
+8.  Open one persistent background R terminal and keep it alive for the task.
+9.  Load with `readRDS()` and execute follow-up commands line by line in that same session.
 
 Live extraction pattern:
 
 ``` bash
-bash scripts/interact_with_rstudio.sh \
+bash SKILL_DIR/scripts/interact_with_rstudio.sh \
   --append-code 'snap_obj <- project_obj$sample_01' \
   --r-state-export 'list(sample_obj = snap_obj, created = Sys.time())'
 ```
 
 Background session pattern:
 
+``` bash
+# Start once and keep this session open for the whole task.
+R --quiet --no-save
+```
+
 ``` r
+# Then execute commands incrementally in that same live terminal session.
 snapshot <- readRDS("/absolute/path/from/state-export")
-# continue interactively with `snapshot` in local R
+dim(snapshot$pca)
+table(snapshot$cluster)
+# Continue step-by-step; avoid sending a large script blob.
 ```
 
 Cleanup:
@@ -129,6 +149,8 @@ Notes:
 -   Export only what is needed: smaller payloads are faster, cheaper, and less likely to block the live session.
 -   Default to exporting derived tables, vectors, embeddings, metadata slices, or marker results instead of entire assay objects.
 -   If package namespaces mismatch, stop and ask the user before continuing.
+-   Keep the same background R process alive and reuse it across follow-up commands.
+-   Do not submit multi-line all-at-once background scripts unless the user explicitly requests that style.
 
 ### `CREATE_NEW_GLOBAL_VARIABLE` (`--create-global-variable`)
 
@@ -142,9 +164,10 @@ Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 
 ### How to call wrapper scripts
 
--   Always call `bash scripts/interact_with_rstudio.sh` (expanded to absolute path); never call low-level socket helper scripts directly.
+-   Define `SKILL_DIR` as the directory containing this `SKILL.md`.
+-   Always call `bash SKILL_DIR/scripts/interact_with_rstudio.sh` (expanded to absolute path); never call low-level socket helper scripts directly.
 -   In Codex tool calls, run wrapper invocations with escalation (`sandbox_permissions=require_escalated`) by default; sandbox execution is a known false-failure mode for `rpostback`/local socket access.
--   For every escalated wrapper call, always provide `prefix_rule=["bash","scripts/interact_with_rstudio.sh"]` (expanded to absolute path); never include runtime flags/code in the prefix rule.
+-   For every escalated wrapper call, always provide `prefix_rule=["bash","SKILL_DIR/scripts/interact_with_rstudio.sh"]`; never include runtime flags/code in the prefix rule.
 -   Set both wait controls explicitly on long or uncertain calls: `--rpc-timeout` for the send step and `--timeout` for result-file wait.
 -   Treat tool `yield_time_ms` as output polling only, not process cancellation. Do not stack retries while a prior wrapper call is still running.
 -   Prefer live runtime env vars (`RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, `RSTUDIO_SESSION_PID`) when present. Do not blindly overwrite them with `suspended-session-data/environment_vars`, which may be stale.
@@ -153,6 +176,9 @@ Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 
 Run these checks before every invocation.
 
+-   Reject complex one-liner construction when equivalent simple line-by-line commands exist.
+-   Reject semicolon-separated multi-statement lines.
+-   Prefer explicit intermediate variables and short commands that are easy to debug.
 -   Reject `<<-`, `->>`, global `assign(...)`, global `rm/remove(...)`, and `source(..., local = FALSE)`.
 -   Reject `save`, `saveRDS`, `load`, and file-creation calls in live-session calls.
 -   Reject `setwd`, `options`, `Sys.setenv`, `attach`, `detach`, `sink`, `system`, `system2`, `q`, `quit`.
@@ -165,6 +191,7 @@ Run these checks before every invocation.
 -   Runtime R errors must be surfaced as `__ERROR__:<message>` in the result payload, never as indefinite waits.
 -   Prefer one live wrapper call to capture state and one live wrapper call to render final result for experimentation tasks.
 -   Avoid sending candidate-by-candidate updates to live RStudio unless the user explicitly asks for that interaction style.
+-   In background R, send one command at a time and wait for its result before sending the next command.
 
 ## Troubleshooting
 
