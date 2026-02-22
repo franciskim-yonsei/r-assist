@@ -12,9 +12,9 @@ Interrogate live RStudio session via `bash SKILL_DIR/scripts/interact_with_rstud
 ## Workflow
 
 1.  Decide the mode of operation: A, B, or C. Discuss with user if unsure.
-2.  Write the required R code.
-3.  Use your defined capabilities to build a call to the wrapper script.
-4.  Make a call to `bash SKILL_DIR/scripts/interact_with_rstudio.sh`.
+2.  Use `python3 SKILL_DIR/scripts/interact_with_rstudio.py` to start an interactive command-building shell.
+3.  Use your defined capabilities to build the R code.
+4.  Apply appropriate options, then send the code.
 5.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
 6.  Inspect output and iterate. If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
 
@@ -32,7 +32,7 @@ Interrogate live RStudio session via `bash SKILL_DIR/scripts/interact_with_rstud
 
 It is imperative that you consider the following constraints:
 
--   Any object you create directly in the console is temporary; it expires after each wrapper call.
+-   Any object you create directly in the console is temporary; it expires after each send cycle.
 -   R functions are slow. Any function you run directly in the console blocks out the user.
 -   R serialization and disk I/O are also slow. Large exports may also block out the user.
 
@@ -59,122 +59,121 @@ Whenever the choice is not obvious, you must take care to identify the minimum s
 
 1.  Identify the minimum objects/functions needed from live RStudio. Build the smallest possible payload expression from live objects in one call (fewest objects possible).
 2.  Default to exporting derived tables, vectors, embeddings, metadata slices, or marker results instead of entire assay objects.
-3.  Use `bash SKILL_DIR/scripts/estimate_export_seconds.sh '<payload>'` to estimate ETA for export.
-4.  Run steps 2-4 with `--benchmark` flag (with optional `--benchmark-unit seconds|ms`) when calling wrapper script to generate benchmarks for small pilot analyses and estimate total ETA for analysis.
+3.  Use `bash SKILL_DIR/scripts/estimate_export_seconds.py '<payload>'` to estimate ETA for export.
+4.  Run steps 2-4 with `benchmark` option to generate benchmarks for small pilot analyses and estimate total ETA for analysis.
 5.  Evaluate the estimates. Report and discuss with user if unsure. Consider pivoting to mode C if either mode is untenable.
 
 ### Extremely expensive computations (mode C)
 
 Use `references/long-computation.md` as the operational playbook for Mode C. It requires careful planning that involves pilot, calibration, unattended launch, checkpointing stages, as well as handoff constraints.
 
-## Step 2. Write code
+## Step 2. Begin command-building shell
 
-### Hard requirements
+-   Define `SKILL_DIR` as the directory containing this `SKILL.md`.
+-   Always call `python3 SKILL_DIR/scripts/interact_with_rstudio.py` (expanded to absolute path); never call low-level socket helper scripts directly.
+-   In Codex tool calls, run scripts with escalation (`sandbox_permissions=require_escalated`) by default; sandbox execution is a known false-failure mode for `rpostback`/local socket access.
+-   For every escalated script call, always provide `prefix_rule=["python3","SKILL_DIR/scripts/interact_with_rstudio.py"]`; never include runtime flags/code in the prefix rule.
+-   For interactive bridge sessions in Codex, use `tty=true` so one persistent session id can be reused with `write_stdin` polling.
+-   Do not use `printf` with pipes or heredoc mode.
 
-Run these checks for every line of code you write.
-
--   Reject `<<-`, `->>`, global `assign(...)`, global `rm/remove(...)`, and `source(..., local = FALSE)`.
--   Reject `save`, `saveRDS`, `load`, and file-creation calls in live-session calls.
--   Reject `setwd`, `options`, `Sys.setenv`, `attach`, `detach`, `sink`, `system`, `system2`, `q`, `quit`.
--   Keep `library()`/`require()` out of live-session calls unless explicitly requested by user intent.
--   For graphical commands in live-session calls, enforce `print(...)` around rendering expressions.
-
-### Highly recommended: keep it simple.
-
--   Avoid complex one-liner construction like giant `list(...)` or heavy inline indexing in one command.
--   Avoid semicolon-separated multi-statement lines and deeply nested expressions.
--   Strongly prefer explicit intermediate variables and short commands that are easy to debug.
--   Keep one action per line in both `--append-code` and background R commands.
--   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
-
-## Step 3. Build a call
+## Step 3. Write code
 
 ### Quick reference
 
+Once you are in the interactive command-building shell, you can exert the following capabilities to build R code. Each capability amounts to a structured input to stdin.
+
 | Capability | Purpose | Scope | Approval |
 |------------------|------------------|------------------|------------------|
-| `SET_RESULT_EXPR` (`--set-result-expr`) | Return one expression value via file transport | Temporary execution scope with global read access | Not required |
-| `APPEND_CODE` (`--append-code`) | Stage helper statements for one invocation | Temporary scratch env | Not required |
-| `R_STATE_EXPORT` (`--r-state-export`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Not required |
-| `CREATE_NEW_GLOBAL_VARIABLE` (`--create-global-variable`) | Create new persistent `.GlobalEnv` binding | Global | Required |
-| `MODIFY_GLOBAL_ENV` (`--modify-global-env`) | Mutate existing persistent state | Global | Required |
+| RESULT (`result:<R expression>`) | Return one expression value via file transport | Temporary execution scope with global read access | Not required |
+| APPEND (`append:<R statement>`) | Stage helper statements for one invocation | Temporary scratch env | Not required |
+| EXPORT (`export:<R expression>`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Not required |
+| CREATE (`create:<name>:=<expr>`) | Create new persistent `.GlobalEnv` binding | Global | Required |
+| MODIFY (`modify:<R statement>`) | Mutate existing persistent state | Global | Required |
 
-### `SET_RESULT_EXPR` (`--set-result-expr`)
+### RESULT (`result:<R expression>`)
 
 Use for one final read-only expression.
 
 -   Only one single-line expression, no assignments (`<-` prohibited!).
--   Multi-step prep goes in `APPEND_CODE`.
--   Skip if `--benchmark` flag is present; result is automatically set to elapsed time.
+-   Multi-step prep goes in APPEND.
+-   Skip if `benchmark` option is on; result is automatically set to elapsed time.
 
 Example:
 
-``` bash
-bash SKILL_DIR/scripts/interact_with_rstudio.sh \
-  --set-result-expr 'class(project_obj$sample_01)'
+```         
+result:class(project_obj$sample_01)
+send
 ```
 
-### `APPEND_CODE` (`--append-code`)
+### APPEND (`append:<R statement>`)
 
 Use for temporary setup and single-shot probing.
 
--   Objects created here expire with the wrapper call.
+-   Objects created here expire with the send-cycle.
 -   Avoid repeated console interactions for iterative debugging.
 -   Do not run exploratory loops that emit many plots in live RStudio by default.
 -   For plot-selection tasks, reserve live `print(...)` for the final selected plot unless user explicitly requests live comparisons.
--   Prefer multiple simple `--append-code` lines rather than one complex `--append-code` expression.
+-   Keep each `append:` line short (prefer \<=120 chars); split long logic across multiple lines to reduce transport/parser fragility.
 
-``` bash
-bash SKILL_DIR/scripts/interact_with_rstudio.sh \
-  --append-code 'obj <- project_obj$sample_01' \
-  --append-code 'plot_obj <- Seurat::DimPlot(obj)' \
-  --set-result-expr 'head(plot_obj$data$colour)'
+```         
+append:obj <- project_obj$sample_01
+append:plot_obj <- Seurat::DimPlot(obj)
+result:head(plot_obj$data$colour)
+send
 ```
 
 Special example: when plots must be visible to the user, make sure to use `print(...)` around calls that return plot objects (ggplot2/patchwork/Seurat plot builders).
 
-``` bash
-bash SKILL_DIR/scripts/interact_with_rstudio.sh \
-  --append-code 'obj <- project_obj$sample_01' \
-  --append-code 'print(Seurat::DimPlot(obj))'
+```         
+append:obj <- project_obj$sample_01
+append:print(Seurat::DimPlot(obj))
+send
 ```
 
-### `R_STATE_EXPORT` (one-time extraction)
+### EXPORT (`export:<R expression>`)
 
-Use when follow-up is likely.
-
-1.  Script returns a path to the exported RDS.
-2.  Open one persistent background R terminal and keep it alive for the task (`R --quiet --no-save`).
-3.  Load with `readRDS()` and execute follow-up commands line by line in that same session.
+Use when follow-up is likely. Script returns a path to the exported RDS.
 
 Example:
 
-``` bash
-bash SKILL_DIR/scripts/interact_with_rstudio.sh \
-  --append-code 'snap_obj <- project_obj$sample_01' \
-  --r-state-export 'list(sample_obj = snap_obj, created = Sys.time())'
+```         
+append:snap_obj <- project_obj$sample_01
+export:list(sample_obj = snap_obj, created = Sys.time())
+send
 ```
 
-### `CREATE_NEW_GLOBAL_VARIABLE` (`--create-global-variable`)
+### CREATE (`create:<name>:=<expr>`)
 
 Use only for explicit user-requested persistent `.GlobalEnv` binding changes.
 
-### `MODIFY_GLOBAL_ENV` (`--modify-global-env`)
+### MODIFY (`modify:<R statement>`)
 
 Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 
-## Step 4. Call wrapper script
+## Step 4. Apply options
 
--   Define `SKILL_DIR` as the directory containing this `SKILL.md`.
--   Always call `bash SKILL_DIR/scripts/interact_with_rstudio.sh` (expanded to absolute path); never call low-level socket helper scripts directly.
--   In Codex tool calls, run wrapper invocations with escalation (`sandbox_permissions=require_escalated`) by default; sandbox execution is a known false-failure mode for `rpostback`/local socket access.
--   For every escalated wrapper call, always provide `prefix_rule=["bash","SKILL_DIR/scripts/interact_with_rstudio.sh"]`; never include runtime flags/code in the prefix rule.
--   Set both wait controls explicitly on long or uncertain calls: `--rpc-timeout` for the send step and `--timeout` for result-file wait.
--   Set timeouts before export; utilize `est_seconds` = ETA for export if computed in step 1:
-    -   `--rpc-timeout` at least equal to `est_seconds`.
-    -   `--timeout` at least `est_seconds + 90`.
--   Treat tool `yield_time_ms` as output polling only, not process cancellation. Do not stack retries while a prior wrapper call is still running.
--   Prefer live runtime env vars (`RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, `RSTUDIO_SESSION_PID`) when present. Do not blindly overwrite them with `suspended-session-data/environment_vars`, which may be stale.
+Options are also set interactively using stdin. Use `<option-name>:<value>.`
+
+-   Timeout-related options: set both explicitly on long or uncertain calls. Ttilize `est_seconds` = ETA computed in step 1 if in mode B.
+    -   `timeout:<seconds>`: pertains to result-file wait. Should be at least `est_seconds + 90`.
+    -   `rpc-timeout:<seconds>`: pertains to send step. Should be at least `est_seconds`.
+-   Connection-related options: do not manually overwrite `RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, or `RSTUDIO_SESSION_PID` during normal operation. `interact_with_rstudio.py` already prefers valid live runtime env vars and only falls back to `suspended-session-data/environment_vars` when needed.
+    -   `session-dir:<dir>`: Override auto session discovery and target one explicit RStudio session directory.
+    -   `id:<int>`: Set JSON-RPC request id (mainly for tracing/debugging); default is `1`.
+    -   `rpostback-bin:<path>`: Override `rpostback` binary path for troubleshooting custom/runtime layouts.
+-   `out:<path>`: Use a fixed result file path instead of an auto-generated temp file when `result:` or `export:` is set.
+-   `benchmark:<on|off>`: Benchmark mode for `result:`; returns elapsed time (not the expression value).
+-   `benchmark-unit:<seconds|ms>`: Unit for benchmark output.
+-   `print-code:<on|off>`: Print generated R snippet to stderr before RPC send.
+-   `capture-output:<on|off>`: Return structured stdout/stderr together with `result:`/`export:` payloads.
+
+Finally, `send` the finished R-code.
+
+-   Critical: `append:`, `result:`, `export:`, `create:`, and `modify` are only stage capabilities. Nothing executes until `send`.
+
+-   After every `send` attempt (success or failure), the bridge clears staged capabilities. Re-stage lines explicitly for the next batch.
+
+-   Treat tool `yield_time_ms` as output polling only, not cancellation. Keep a single live `interact_with_rstudio.py` exec session per run, poll that same session while `send` is in flight, and do not start another `send`/process until the prior one returns.
 
 ## Step 5. Working with background sessions (mode B)
 
@@ -201,10 +200,29 @@ unlink("/absolute/path/from/state-export")
 
 ## Guardrails
 
--   Double-check: whole-object exports are rarely needed. Prefer exporting a minimal payload with only the fields needed for follow-up (embedding coordinates, metadata, etc). Avoid exporting whole objects unless the user explicitly asks.
--   Runtime R errors must be surfaced as `__ERROR__:<message>` in the result payload, never as indefinite waits.
--   Avoid sending candidate-by-candidate updates to live RStudio unless the user explicitly asks for that interaction style.
+### Hard code requirements
+
+Run these checks for every line of code you write.
+
+-   Reject `<<-`, `->>`, global `assign(...)`, global `rm/remove(...)`, and `source(..., local = FALSE)`.
+-   Reject `save`, `saveRDS`, `load`, and file-creation calls in live-session calls.
+-   Reject `setwd`, `options`, `Sys.setenv`, `attach`, `detach`, `sink`, `system`, `system2`, `q`, `quit`.
+-   Keep `library()`/`require()` out of live-session calls unless explicitly requested by user intent.
+-   For graphical commands in live-session calls, enforce `print(...)` around rendering expressions.
+
+### Highly recommended: keep code simple.
+
+-   Avoid complex one-liner construction like giant `list(...)` or heavy inline indexing in one command.
+-   Avoid semicolon-separated multi-statement lines and deeply nested expressions.
+-   Strongly prefer explicit intermediate variables and short commands that are easy to debug.
+-   Keep one action per line in both `append:` and background R commands.
+-   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
+
+### Important reminder
+
+-   Whole-object exports are rarely needed. Prefer exporting a minimal payload with only the fields needed for follow-up (embedding coordinates, metadata, etc). Avoid exporting whole objects unless the user explicitly asks.
+-   R functions are slow. Estimate ETA conservatively. Discuss with the user before beginning expensive computations in the live console.
 
 ## Troubleshooting
 
-Use [`references/troubleshooting.md`](references/troubleshooting.md) for timeout/error triage and recovery steps. Open it whenever wrapper output contains timeout messages, `rpostback` failures, `__SYNTAX_ERROR__`, `__ERROR__`, or plotting visibility issues.
+Use [`references/troubleshooting.md`](references/troubleshooting.md) for timeout/error triage and recovery steps. Open it whenever output contains timeout messages, `rpostback` failures, `__SYNTAX_ERROR__`, `__ERROR__`, or plotting visibility issues.

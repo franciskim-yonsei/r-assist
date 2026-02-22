@@ -71,6 +71,10 @@ Rerun the same single-segment command with escalation.
 
 -   Do not retry by making the same command more complex.
 
+-   If the message is `no applicable method for 'conditionMessage' applied to an object of class "character"`, the bridge is seeing a non-condition error payload.
+
+-   Retry with `print-code:on` and `capture-output:on` once, then patch the interactive code path with a helper that coalesces condition messages with `as.character` for non-condition objects.
+
 ### `Result expression cannot contain '<-' assignment.`
 
 Move assignments to `APPEND_CODE`.
