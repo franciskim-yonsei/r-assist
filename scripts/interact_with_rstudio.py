@@ -858,6 +858,7 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
         r_exec_lines.append("  .codex_result_expr <- .codex_make_preview(.codex_preview_expr)")
         r_exec_lines.append("}")
         r_exec_lines.append("rm(.codex_preview_expr)")
+        r_exec_lines.append(".codex_result_expr")
 
     if state.result_expr:
         if state.benchmark_mode:
