@@ -87,15 +87,35 @@ Once you are in the interactive command-building shell, you can exert the follow
 
 | Capability | Purpose | Scope | Approval |
 |------------------|------------------|------------------|------------------|
+| PREVIEW (`<<preview>>EXPR`) | Return a conservative, short summary for one expression | Temporary execution scope with global read access | Not required |
 | RESULT (`<<result>>EXPR`) | Set one expression value that will be returned this run | Temporary execution scope with global read access | Not required |
 | APPEND (bare R statement without command prefix) | Stage helper statements. Primary vehicle for adding code | Temporary scratch env | Not required |
 | EXPORT (`<<export>>EXPR`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Not required |
 | CREATE (`<<create>>NAME:=EXPR`) | Create new persistent `.GlobalEnv` binding | Global | Required |
 | MODIFY (`<<modify>>STMT`) | Mutate existing persistent state | Global | Required |
 
+### PREVIEW (`<<preview>>EXPR`)
+
+Default to this capability for read-only inspection. `<<preview>>` is conservative by design: it returns compact metadata plus a bounded text preview (for example from `show(...)` for formal/S4 objects or `str(..., max.level = 1)` for other objects), with explicit truncation limits.
+
+-   Use `<<preview>>` first unless exact value transport is truly necessary.
+-   `<<preview>>` is strict: exactly one physical line with one complete expression; no assignments (`<-` prohibited).
+-   Keep prep in APPEND and reserve `<<preview>>` for one final object/expression.
+-   `<<preview>>` cannot be combined with `<<result>>` or `<<export>>` in the same run.
+
+Example:
+
+```         
+obj <- cca
+<<preview>>Assays(obj)
+<<run>>
+```
+
 ### RESULT (`<<result>>EXPR`)
 
-Use for one final read-only expression. Each run includes at most one `<<run>>`.
+Use for one final read-only expression when precision matters and preview is insufficient. Each run includes at most one `<<run>>`.
+
+Critical warning: `<<result>>` currently serializes payloads with `dput(...)`. For large or complex objects (especially formal/S4 objects like Seurat internals), this can behave like full structural serialization and may block the live console unexpectedly.
 
 -   `<<result>>` is strict: exactly one physical line with one complete expression; no assignments (`<-` prohibited).
 -   Do not place multi-line blocks (`{...}`), loops, or function definitions in `<<result>>`. Stage those with APPEND first.
@@ -103,6 +123,10 @@ Use for one final read-only expression. Each run includes at most one `<<run>>`.
 -   If `<<result>>` ends with an operator/comma/open delimiter (for example `<<result>>list(`), the bridge rejects it as incomplete before `<<run>>`.
 -   Multi-step prep goes in APPEND.
 -   Skip if `benchmark` option is on; result is automatically set to elapsed time.
+-   Before requesting `<<result>>`, explicitly probe:
+    `class(x)`, `isS4(x)`, `dim(x)`/`length(x)`, and `object.size(x)`.
+-   If object is formal/S4, high-dimensional, or large, do not `<<result>>` the raw object.
+    Manually construct a safe representation first (for example `str(x, max.level = 1)`, `head(...)`, selected vectors/tables).
 
 Example:
 
@@ -206,14 +230,14 @@ Options are also set interactively using stdin. Use `<<option-name>>VALUE`.
     -   `<<session-dir>>DIR`: Override auto session discovery and target one explicit RStudio session directory.
     -   `<<id>>INT`: Set JSON-RPC request id (mainly for tracing/debugging); default is `1`.
     -   `<<rpostback-bin>>PATH`: Override `rpostback` binary path for troubleshooting custom/runtime layouts.
--   `<<out>>PATH`: Use a fixed result file path instead of an auto-generated temp file when `<<result>>` or `<<export>>` is set.
+-   `<<out>>PATH`: Use a fixed result file path instead of an auto-generated temp file when `<<preview>>`, `<<result>>`, or `<<export>>` is set.
 -   `<<benchmark>>ON|OFF`: Benchmark mode for `<<result>>`; returns elapsed time (not the expression value).
 -   `<<benchmark-unit>>SECONDS|MS`: Unit for benchmark output.
 -   `<<print-code>>ON|OFF`: Print generated R snippet to stderr before RPC run.
 
 Finally, `<<run>>` the finished R-code.
 
--   Critical: APPEND, RESULT, EXPORT, CREATE, and MODIFY are only stage capabilities. Nothing executes until `<<run>>`.
+-   Critical: APPEND, PREVIEW, RESULT, EXPORT, CREATE, and MODIFY are only stage capabilities. Nothing executes until `<<run>>`.
 
 -   After every `<<run>>` attempt (success or failure), the bridge clears staged capabilities. Re-stage lines explicitly for the next batch.
 
@@ -224,6 +248,7 @@ Finally, `<<run>>` the finished R-code.
 Bridge output interpretation:
 
 -   Success returns a structured payload with `result`, `stdout`, and `stderr`.
+-   `<<preview>>` success returns a compact preview payload (metadata + truncated preview lines), not a full-fidelity object dump.
 -   APPEND-only runs are treated as success with implicit `result = NULL` plus captured `stdout`/`stderr`.
 -   Failure returns a structured payload with `error`, `stdout`, and `stderr`.
 -   `stdout` can be noisy and non-empty on successful runs (for example from `print(...)`).
@@ -269,6 +294,8 @@ Run these checks for every line of code you write.
 -   Avoid complex one-liner construction like giant `list(...)` or heavy inline indexing in one command.
 -   Avoid semicolon-separated multi-statement lines and deeply nested expressions.
 -   Strongly prefer explicit intermediate variables and short commands that are easy to debug.
+-   Prefer `<<preview>>` as the first probe. Escalate to `<<result>>` only when exact values are required.
+-   Before any `<<result>>`, run explicit probes for class/category (`class`, `isS4`), shape (`dim` or `length`), and size (`object.size`).
 -   Keep one action per line in both append and background R commands.
 -   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
 -   If `<<run>>` unexpectedly fails, run `<<smoke>>`, then use `<<show>>` to verify staged capabilities before retrying.

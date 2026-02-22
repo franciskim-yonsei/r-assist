@@ -60,6 +60,7 @@ COMMAND_PREFIX_PATTERN = re.compile(r"^\s*<<([A-Za-z][A-Za-z0-9-]*)>>(.*)$")
 @dataclass
 class State:
     append_code_snippets: List[str] = field(default_factory=list)
+    preview_expr: str = ""
     result_expr: str = ""
     state_export_expr: str = ""
     create_global_specs: List[str] = field(default_factory=list)
@@ -77,6 +78,7 @@ class State:
 
     def clear_capabilities(self) -> None:
         self.append_code_snippets = []
+        self.preview_expr = ""
         self.result_expr = ""
         self.state_export_expr = ""
         self.create_global_specs = []
@@ -100,6 +102,7 @@ KNOWN_PREFIXES = {
     "quit",
     "run",
     "append",
+    "preview",
     "result",
     "export",
     "create",
@@ -311,6 +314,13 @@ def validate_result_expr(expr: str) -> str:
     normalized = validate_single_line_expression_contract(expr, "result")
     validate_common_blocklist(expr, "Result expression")
     validate_assignment_free(expr, "Result expression")
+    return normalized
+
+
+def validate_preview_expr(expr: str) -> str:
+    normalized = validate_single_line_expression_contract(expr, "preview")
+    validate_common_blocklist(expr, "Preview expression")
+    validate_assignment_free(expr, "Preview expression")
     return normalized
 
 
@@ -582,6 +592,7 @@ def format_parse_error_snippet(r_code: str, line_no: int, context: int = 2) -> s
 def pending_capability_count(state: State) -> int:
     return (
         len(state.append_code_snippets)
+        + int(bool(state.preview_expr))
         + int(bool(state.result_expr))
         + int(bool(state.state_export_expr))
         + len(state.create_global_specs)
@@ -591,37 +602,55 @@ def pending_capability_count(state: State) -> int:
 
 def build_prompt(state: State) -> str:
     pending = pending_capability_count(state)
+    preview_set = 1 if state.preview_expr else 0
     result_set = 1 if state.result_expr else 0
     export_set = 1 if state.state_export_expr else 0
-    return f"rstudio-bridge[pending={pending},result={result_set},export={export_set}]> "
+    return (
+        f"rstudio-bridge[pending={pending},preview={preview_set},"
+        f"result={result_set},export={export_set}]> "
+    )
 
 
 def validate_state_for_run(state: State) -> RunContext:
     has_append = bool(state.append_code_snippets)
+    has_preview = bool(state.preview_expr)
     has_result = bool(state.result_expr)
     has_export = bool(state.state_export_expr)
     has_create = bool(state.create_global_specs)
     has_modify = bool(state.modify_global_snippets)
-    has_any = has_append or has_result or has_export or has_create or has_modify
-    has_terminal = has_result or has_export or has_create or has_modify
+    has_any = has_append or has_preview or has_result or has_export or has_create or has_modify
+    has_terminal = has_preview or has_result or has_export or has_create or has_modify
 
     if not has_any:
         raise ValidationError("At least one capability is required.")
 
     if state.state_export_expr:
-        if state.result_expr or state.create_global_specs or state.modify_global_snippets:
+        if (
+            state.preview_expr
+            or state.result_expr
+            or state.create_global_specs
+            or state.modify_global_snippets
+        ):
             raise ValidationError(
-                "export cannot be combined with result, create, or modify."
+                "export cannot be combined with preview, result, create, or modify."
             )
+
+    if state.preview_expr and state.result_expr:
+        raise ValidationError("preview cannot be combined with result.")
 
     state.benchmark_unit = parse_benchmark_unit(state.benchmark_unit)
 
     if state.benchmark_mode:
         if not state.result_expr:
             raise ValidationError("benchmark requires result.")
-        if state.state_export_expr or state.create_global_specs or state.modify_global_snippets:
+        if (
+            state.preview_expr
+            or state.state_export_expr
+            or state.create_global_specs
+            or state.modify_global_snippets
+        ):
             raise ValidationError(
-                "benchmark cannot be combined with export, create, or modify."
+                "benchmark cannot be combined with preview, export, create, or modify."
             )
 
     ensure_int_string(state.request_id, "id")
@@ -630,6 +659,9 @@ def validate_state_for_run(state: State) -> RunContext:
 
     for snippet in state.append_code_snippets:
         validate_append_snippet(snippet)
+
+    if state.preview_expr:
+        validate_preview_expr(state.preview_expr)
 
     if state.result_expr:
         validate_result_expr(state.result_expr)
@@ -644,7 +676,7 @@ def validate_state_for_run(state: State) -> RunContext:
         validate_modify_global_snippet(snippet)
 
     append_only = has_append and not has_terminal
-    expect_result = bool(state.result_expr or state.state_export_expr or append_only)
+    expect_result = bool(state.preview_expr or state.result_expr or state.state_export_expr or append_only)
 
     out_path = state.out_path
     is_temp_out_path = False
@@ -732,6 +764,80 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
 
     for snippet in state.append_code_snippets:
         r_exec_lines.append(snippet)
+
+    if state.preview_expr:
+        r_exec_lines.append(
+            ".codex_limit_preview_lines <- function(lines, max_lines = 18L, max_line_chars = 160L, max_chars = 2400L) {"
+        )
+        r_exec_lines.append("  if (is.null(lines)) return(character(0))")
+        r_exec_lines.append("  lines <- as.character(lines)")
+        r_exec_lines.append("  if (length(lines) == 0) return(character(0))")
+        r_exec_lines.append("  lines <- vapply(lines, function(line) {")
+        r_exec_lines.append('    line <- gsub("[\\r\\n]+", " ", line)')
+        r_exec_lines.append("    if (nchar(line, type = \"bytes\") > max_line_chars) {")
+        r_exec_lines.append('      paste0(substr(line, 1L, max_line_chars), "... [line truncated]")')
+        r_exec_lines.append("    } else {")
+        r_exec_lines.append("      line")
+        r_exec_lines.append("    }")
+        r_exec_lines.append("  }, character(1), USE.NAMES = FALSE)")
+        r_exec_lines.append("  if (length(lines) > max_lines) {")
+        r_exec_lines.append("    omitted <- length(lines) - max_lines")
+        r_exec_lines.append('    lines <- c(lines[seq_len(max_lines)], paste0("... [", omitted, " more lines omitted]"))')
+        r_exec_lines.append("  }")
+        r_exec_lines.append("  total <- 0L")
+        r_exec_lines.append("  kept <- character(0)")
+        r_exec_lines.append("  for (line in lines) {")
+        r_exec_lines.append("    line_bytes <- nchar(line, type = \"bytes\")")
+        r_exec_lines.append("    sep <- if (length(kept) == 0L) 0L else 1L")
+        r_exec_lines.append("    if (total + sep + line_bytes > max_chars) {")
+        r_exec_lines.append('      kept <- c(kept, "... [preview truncated by byte limit]")')
+        r_exec_lines.append("      break")
+        r_exec_lines.append("    }")
+        r_exec_lines.append("    kept <- c(kept, line)")
+        r_exec_lines.append("    total <- total + sep + line_bytes")
+        r_exec_lines.append("  }")
+        r_exec_lines.append("  kept")
+        r_exec_lines.append("}")
+        r_exec_lines.append(".codex_make_preview <- function(x) {")
+        r_exec_lines.append("  .safe <- function(expr, fallback = NA) tryCatch(expr, error = function(e) fallback)")
+        r_exec_lines.append("  .dims <- .safe(dim(x), NULL)")
+        r_exec_lines.append("  .size_bytes <- .safe(as.numeric(object.size(x)), NA_real_)")
+        r_exec_lines.append("  .meta <- list(")
+        r_exec_lines.append('    class = .safe(class(x), "<class_error>"),')
+        r_exec_lines.append('    typeof = .safe(typeof(x), "<typeof_error>"),')
+        r_exec_lines.append('    mode = .safe(mode(x), "<mode_error>"),')
+        r_exec_lines.append("    is_s4 = .safe(isS4(x), NA),")
+        r_exec_lines.append("    length = .safe(length(x), NA_integer_),")
+        r_exec_lines.append("    dim = .dims,")
+        r_exec_lines.append("    object_size_mb = if (is.na(.size_bytes)) NA_real_ else round(.size_bytes / (1024^2), 3)")
+        r_exec_lines.append("  )")
+        r_exec_lines.append('  .printer <- if (.safe(isS4(x), FALSE)) "show" else "str"')
+        r_exec_lines.append("  .lines <- .safe({")
+        r_exec_lines.append('    if (.printer == "show") {')
+        r_exec_lines.append("      capture.output(show(x))")
+        r_exec_lines.append("    } else {")
+        r_exec_lines.append(
+            '      capture.output(str(x, max.level = 1, list.len = 10, vec.len = 12, give.attr = FALSE, strict.width = "cut"))'
+        )
+        r_exec_lines.append("    }")
+        r_exec_lines.append("  }, character(0))")
+        r_exec_lines.append("  if (length(.lines) == 0) {")
+        r_exec_lines.append(
+            '    .lines <- .safe(capture.output(str(x, max.level = 1, list.len = 10, vec.len = 12, give.attr = FALSE, strict.width = "cut")), character(0))'
+        )
+        r_exec_lines.append("  }")
+        r_exec_lines.append("  .lines <- .codex_limit_preview_lines(.lines)")
+        r_exec_lines.append("  list(meta = .meta, preview = .lines)")
+        r_exec_lines.append("}")
+        r_exec_lines.append(
+            f'.codex_preview_expr <- tryCatch(({state.preview_expr}), error = function(e) e)'
+        )
+        r_exec_lines.append('if (inherits(.codex_preview_expr, "error")) {')
+        r_exec_lines.append("  .codex_result_expr <- .codex_preview_expr")
+        r_exec_lines.append("} else {")
+        r_exec_lines.append("  .codex_result_expr <- .codex_make_preview(.codex_preview_expr)")
+        r_exec_lines.append("}")
+        r_exec_lines.append("rm(.codex_preview_expr)")
 
     if state.result_expr:
         if state.benchmark_mode:
@@ -909,7 +1015,7 @@ def execute_run(state: State, script_dir: Path) -> None:
         if run_ctx.append_only:
             print(
                 "Warning: APPEND-only run returns implicit result = NULL with captured stdout/stderr. "
-                "Add <<result>>/<<export>>/<<create>>/<<modify>> if you need explicit payloads.",
+                "Add <<preview>>/<<result>>/<<export>>/<<create>>/<<modify>> if you need explicit payloads.",
                 file=sys.stderr,
             )
 
@@ -984,6 +1090,7 @@ def print_help() -> None:
         "Commands:\n"
         "  <R statement>                 Append statement in scratch env\n"
         "  <<append>><R statement>       Explicit append statement\n"
+        "  <<preview>><R expression>     Return conservative short preview for one expression\n"
         "  <<result>><R expression>      Set one complete single-line result expression\n"
         "  <<export>><R expression>      Export expression via saveRDS and return file path\n"
         "  <<create>><name>:=<expr>      Create new variable in .GlobalEnv\n"
@@ -1012,6 +1119,7 @@ def show_state(state: State) -> None:
     print(f"  pending capabilities: {pending_capability_count(state)}")
     print("State summary:")
     print(f"  append snippets: {len(state.append_code_snippets)}")
+    print(f"  preview set: {bool(state.preview_expr)}")
     print(f"  result set: {bool(state.result_expr)}")
     print(f"  export set: {bool(state.state_export_expr)}")
     print(f"  create specs: {len(state.create_global_specs)}")
@@ -1083,6 +1191,8 @@ def apply_input_line(state: State, line: str) -> Optional[str]:
             return key
     elif key == "result":
         state.result_expr = validate_result_expr(payload)
+    elif key == "preview":
+        state.preview_expr = validate_preview_expr(payload)
     elif key == "export":
         state.state_export_expr = validate_state_export_expr(payload)
     elif key == "create":
