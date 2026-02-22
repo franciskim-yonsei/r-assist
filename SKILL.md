@@ -7,14 +7,14 @@ description: Trigger for prompts where correctness depends on user's live RStudi
 
 ## Overview
 
-Interrogate live RStudio session via `bash SKILL_DIR/scripts/interact_with_rstudio.sh` (where `SKILL_DIR` refers to the directory containing this `SKILL.md` file).
+Interrogate live RStudio session via `bash SKILL_DIR/scripts/interact_with_rstudio.sh` (Convention in this document: `SKILL_DIR` refers to the directory containing this `SKILL.md` file).
 
 ## Workflow
 
-1.  Decide the mode of operation: A vs B. Consider fast-track decision; if impossible, deliberate.
+1.  Decide the mode of operation: A, B, or C. Discuss with user if unsure.
 2.  Write the required R code.
 3.  Use your defined capabilities to build a call to the wrapper script.
-4.  Make a call to `bash SKILL_DIR/scripts/interact_with_rstudio.sh` (where `SKILL_DIR` refers to the directory containing this `SKILL.md` file).
+4.  Make a call to `bash SKILL_DIR/scripts/interact_with_rstudio.sh`.
 5.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
 6.  Inspect output and iterate. If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
 
@@ -24,8 +24,9 @@ Interrogate live RStudio session via `bash SKILL_DIR/scripts/interact_with_rstud
 
 | Mode | Description | Pros | Cons | Use for |
 |---------------|---------------|---------------|---------------|---------------|
-| A | Carry out analysis directly in the live console | Avoids expensive exports | Objects expire. May clutter or block user console | One-shot reads/checks |
+| A | Carry out analysis directly in the live console | Avoids expensive exports | Objects expire. May clutter or block console | One-shot reads/checks |
 | B | Export once, then continue in background R session | Avoids blocking console with long costly analyses | Export may be costly | Experimentation, comparison, sweeps |
+| C | Run unattended long/expensive jobs | Preserves progress and resumability for long runs | Requires stricter planning and run management | Overnight runs, large sweeps, heavy integrations |
 
 ### Primary concerns
 
@@ -50,16 +51,21 @@ Sometimes the task clearly belongs to a certain pattern and the optimal choice i
     -   large intermediates have to be generated,
     -   objects are very small or may be trimmed down to small subsets/fields, and/or
     -   multiple expensive follow-ups are likely.
+-   Choose mode C when extremely expensive computations must run unattended, i.e. when even a cursory look predicts \>30min ETA. Use `references/long-computation.md` if committing to this path.
 
 ### Deliberate and discuss
 
-Whenever the choice is not obvious, you must take care to identify the minimum scope of analysis. Discuss the optimal approach with the user.
+Whenever the choice is not obvious, you must take care to identify the minimum scope of analysis. Discuss the optimal approach with the user. Following are some general recommendations:
 
 1.  Identify the minimum objects/functions needed from live RStudio. Build the smallest possible payload expression from live objects in one call (fewest objects possible).
 2.  Default to exporting derived tables, vectors, embeddings, metadata slices, or marker results instead of entire assay objects.
-3.  Proceed to following steps to probe payload size in live R (`object.size(...)`).
-4.  Use that information to estimate ETA for export: `est_seconds = max(5, ceiling(0.5 * size_in_MB + 10))`.
-5.  If `est_seconds > 60`, ask the user for approval before export.
+3.  Use `bash SKILL_DIR/scripts/estimate_export_seconds.sh '<payload>'` to estimate ETA for export.
+4.  Run steps 2-4 with `--benchmark` flag (with optional `--benchmark-unit seconds|ms`) when calling wrapper script to generate benchmarks for small pilot analyses and estimate total ETA for analysis.
+5.  Evaluate the estimates. Report and discuss with user if unsure. Consider pivoting to mode C if either mode is untenable.
+
+### Extremely expensive computations (mode C)
+
+Use `references/long-computation.md` as the operational playbook for Mode C. It requires careful planning that involves pilot, calibration, unattended launch, checkpointing stages, as well as handoff constraints.
 
 ## Step 2. Write code
 
@@ -99,6 +105,7 @@ Use for one final read-only expression.
 
 -   Only one single-line expression, no assignments (`<-` prohibited!).
 -   Multi-step prep goes in `APPEND_CODE`.
+-   Skip if `--benchmark` flag is present; result is automatically set to elapsed time.
 
 Example:
 
@@ -128,8 +135,8 @@ Special example: when plots must be visible to the user, make sure to use `print
 
 ``` bash
 bash SKILL_DIR/scripts/interact_with_rstudio.sh \
-  --append-code 'obj <- otic[[4]]' \
-  --append-code 'print(Seurat::DimPlot(obj, reduction = "umap.rna"))'
+  --append-code 'obj <- project_obj$sample_01' \
+  --append-code 'print(Seurat::DimPlot(obj))'
 ```
 
 ### `R_STATE_EXPORT` (one-time extraction)
@@ -148,13 +155,6 @@ bash SKILL_DIR/scripts/interact_with_rstudio.sh \
   --r-state-export 'list(sample_obj = snap_obj, created = Sys.time())'
 ```
 
-Notes:
-
--   This background process has no shared memory with RStudio; load libraries explicitly as needed because attached packages in RStudio are not inherited.
--   If package namespaces mismatch, stop and ask the user before continuing.
--   Keep the same background R process alive and reuse it across follow-up commands.
--   Do not submit multi-line all-at-once background scripts unless the user explicitly requests that style.
-
 ### `CREATE_NEW_GLOBAL_VARIABLE` (`--create-global-variable`)
 
 Use only for explicit user-requested persistent `.GlobalEnv` binding changes.
@@ -170,13 +170,13 @@ Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 -   In Codex tool calls, run wrapper invocations with escalation (`sandbox_permissions=require_escalated`) by default; sandbox execution is a known false-failure mode for `rpostback`/local socket access.
 -   For every escalated wrapper call, always provide `prefix_rule=["bash","SKILL_DIR/scripts/interact_with_rstudio.sh"]`; never include runtime flags/code in the prefix rule.
 -   Set both wait controls explicitly on long or uncertain calls: `--rpc-timeout` for the send step and `--timeout` for result-file wait.
--   Set timeouts using `est_seconds` computed in step 1before export:
+-   Set timeouts before export; utilize `est_seconds` = ETA for export if computed in step 1:
     -   `--rpc-timeout` at least equal to `est_seconds`.
     -   `--timeout` at least `est_seconds + 90`.
 -   Treat tool `yield_time_ms` as output polling only, not process cancellation. Do not stack retries while a prior wrapper call is still running.
 -   Prefer live runtime env vars (`RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, `RSTUDIO_SESSION_PID`) when present. Do not blindly overwrite them with `suspended-session-data/environment_vars`, which may be stale.
 
-## Step 5. Working with background sessions
+## Step 5. Working with background sessions (mode B)
 
 Example:
 
@@ -207,23 +207,4 @@ unlink("/absolute/path/from/state-export")
 
 ## Troubleshooting
 
--   `RPC send timed out after <n>s.`: hard timeout fired while sending to RStudio.
-    -   Check for lingering wrapper processes and stop them before retrying.
-    -   It is extremely likely that the root cause is an expensive demand from your side. Be patient and wait before retrying, and re-evaluate your strategy next time.
--   `rpostback timed out ...` with stale-looking metadata (`abend=1`, dead `env-session-pid`): treat this as a stale snapshot signal first, not a mandatory user refresh. Ensure caller preserves live runtime env vars instead of forcing snapshot env.
--   `Timed out waiting for result file: ...`: RPC send returned but no result payload arrived in time. Read the emitted `Timeout diagnostics: causes=...` line before retrying.
-    -   `compute_still_running`: treat as active live-console compute. Do not send more work; interrupt/wait first.
-    -   `handoff_or_write_delay`: compute may have finished but result-file handoff lagged. Increase `--timeout`, reduce payload, retry once.
-    -   `output_path_unavailable`: result path likely disappeared/unwritable. Verify `/tmp` availability/permissions and retry.
-    -   `session_liveness_issue`: snapshot/env likely stale or rsession restarted. Re-resolve live env vars and retry once.
-    -   `unknown`: state is ambiguous; check `executing` status and avoid stacking retries.
--   If `Timed out waiting for result file` follows `R_STATE_EXPORT`, re-estimate payload size/time, increase both `--rpc-timeout` and `--timeout`, or reduce payload scope and retry once.
--   Stale `/tmp/codex_rstudio_session-*.lock` with no active wrapper process: remove the stale lock, then retry once.
--   `rpostback did not return a JSON-RPC result (rc=1)` (including stale-looking `path:` details such as `/home/<user>/<stream>`): treat sandbox restriction as the default diagnosis; rerun the same single-segment command with escalation before attributing failure to the RStudio session.
--   Stale `rpostback.log` tail can mislead root-cause analysis; if log mtime did not change during the current invocation, do not treat that line as current.
--   `system error 1 (Operation not permitted)` from `rpostback`: rerun the same single-segment command with escalation.
--   `timed out` unknown-state: wait for session status and retry once.
--   `__SYNTAX_ERROR__`: regenerate the live-code snippets; parsing failed before execution. But never retry by making the same command more complex. Retry by splitting it into smaller steps.
--   `__ERROR__:<message>`: runtime error occurred while evaluating generated code (including missing objects); use the message as the failure signal and retry with corrected R snippet.
--   `Result expression cannot contain '<-' assignment.`: move assignments to `APPEND_CODE`.
--   Plot not shown: wrap plotting call in `print(...)`, e.g. `print(Seurat::DimPlot(...))`.
+Use [`references/troubleshooting.md`](references/troubleshooting.md) for timeout/error triage and recovery steps. Open it whenever wrapper output contains timeout messages, `rpostback` failures, `__SYNTAX_ERROR__`, `__ERROR__`, or plotting visibility issues.

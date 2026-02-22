@@ -7,6 +7,7 @@ Usage:
   interact_with_rstudio.sh [options]
     [--append-code '<R statement>']...
     [--set-result-expr '<R expression>']
+    [--benchmark] [--benchmark-unit <seconds|ms>]
     [--r-state-export '<R expression>']
     [--create-global-variable '<name>=<expr>']...
     [--modify-global-env '<R statement>']
@@ -18,6 +19,8 @@ Options:
   --out <path>                  Output file for result transport (optional)
   --timeout <seconds>           Wait timeout for result file (default: 8)
   --rpc-timeout <seconds>       Hard timeout for RPC send step (default: 12)
+  --benchmark                   Benchmark --set-result-expr evaluation and return elapsed time
+  --benchmark-unit <unit>       Benchmark result unit: seconds or ms (default: seconds)
   --print-code                  Print generated R snippet to stderr
   -h, --help                    Show this help
 
@@ -43,6 +46,9 @@ Examples:
   bash scripts/interact_with_rstudio.sh \
     --append-code 'snap_obj <- project_obj$sample_01' \
     --r-state-export 'list(sample_obj = snap_obj, created = Sys.time())'
+  bash scripts/interact_with_rstudio.sh \
+    --benchmark --benchmark-unit ms \
+    --set-result-expr 'for (i in 1:1000) { sqrt(i) }'
 USAGE
 }
 
@@ -62,6 +68,8 @@ IS_TEMP_OUT_PATH=0
 EXPECT_RESULT=0
 PRINT_CODE=0
 STATE_EXPORT_PATH=""
+BENCHMARK_MODE=0
+BENCHMARK_UNIT="seconds"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RPC_SCRIPT="$SCRIPT_DIR/communicate_with_rstudio_console_with_rpc_low_level.sh"
@@ -583,6 +591,14 @@ while [[ $# -gt 0 ]]; do
       RPC_TIMEOUT_SECONDS="${2-}"
       shift 2
       ;;
+    --benchmark)
+      BENCHMARK_MODE=1
+      shift
+      ;;
+    --benchmark-unit)
+      BENCHMARK_UNIT="${2-}"
+      shift 2
+      ;;
     --print-code)
       PRINT_CODE=1
       shift
@@ -611,6 +627,22 @@ fi
 if [[ -n "$STATE_EXPORT_EXPR" ]]; then
   if [[ -n "$RESULT_EXPR" ]] || (( ${#CREATE_GLOBAL_SPECS[@]} > 0 )) || (( ${#MODIFY_GLOBAL_SNIPPETS[@]} > 0 )); then
     echo "--r-state-export cannot be combined with --set-result-expr, --create-global-variable, or --modify-global-env." >&2
+    exit 2
+  fi
+fi
+
+if [[ "$BENCHMARK_UNIT" != "seconds" && "$BENCHMARK_UNIT" != "ms" ]]; then
+  echo "--benchmark-unit must be either 'seconds' or 'ms'." >&2
+  exit 2
+fi
+
+if [[ "$BENCHMARK_MODE" == "1" ]]; then
+  if [[ -z "$RESULT_EXPR" ]]; then
+    echo "--benchmark requires --set-result-expr." >&2
+    exit 2
+  fi
+  if [[ -n "$STATE_EXPORT_EXPR" ]] || (( ${#CREATE_GLOBAL_SPECS[@]} > 0 )) || (( ${#MODIFY_GLOBAL_SNIPPETS[@]} > 0 )); then
+    echo "--benchmark cannot be combined with --r-state-export, --create-global-variable, or --modify-global-env." >&2
     exit 2
   fi
 fi
@@ -681,7 +713,15 @@ for snippet in "${APPEND_CODE_SNIPPETS[@]}"; do
 done
 
 if [[ -n "$RESULT_EXPR" ]]; then
-  R_EXEC_LINES+=(".codex_result_expr <- tryCatch((${RESULT_EXPR}), error = function(e) e)")
+  if [[ "$BENCHMARK_MODE" == "1" ]]; then
+    R_EXEC_LINES+=(".codex_bench_t0 <- proc.time()[[\"elapsed\"]]")
+    R_EXEC_LINES+=(".codex_result_expr <- tryCatch({ invisible((${RESULT_EXPR})); proc.time()[[\"elapsed\"]] - .codex_bench_t0 }, error = function(e) e)")
+    if [[ "$BENCHMARK_UNIT" == "ms" ]]; then
+      R_EXEC_LINES+=("if (!inherits(.codex_result_expr, \"error\")) .codex_result_expr <- .codex_result_expr * 1000")
+    fi
+  else
+    R_EXEC_LINES+=(".codex_result_expr <- tryCatch((${RESULT_EXPR}), error = function(e) e)")
+  fi
 fi
 
 if [[ -n "$STATE_EXPORT_EXPR" ]]; then
