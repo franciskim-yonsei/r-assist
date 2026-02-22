@@ -14,10 +14,10 @@ Interrogate live RStudio session via `python3 SKILL_DIR/scripts/interact_with_rs
 1.  Decide the mode of operation: A, B, or C. Discuss with user if unsure.
 2.  Use `python3 SKILL_DIR/scripts/interact_with_rstudio.py` to start an interactive command-building shell.
 3.  Use your defined capabilities to build the R code.
-4.  Apply appropriate options, then send the code.
+4.  Apply appropriate options, then run the code.
 5.  Inspect output and iterate.
 6.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
-7.  If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
+7.  If the user expects live output, return only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
 
 ## Step 1. Decide mode of operation
 
@@ -27,46 +27,37 @@ Interrogate live RStudio session via `python3 SKILL_DIR/scripts/interact_with_rs
 |---------------|---------------|---------------|---------------|---------------|
 | A | Carry out analysis directly in the live console | Avoids expensive exports | Objects expire. May clutter or block console | One-shot reads/checks |
 | B | Export once, then continue in background R session | Avoids blocking console with long costly analyses | Export may be costly | Experimentation, comparison, sweeps |
-| C | Run unattended long/expensive jobs | Preserves progress and resumability for long runs | Requires stricter planning and run management | Overnight runs, large sweeps, heavy integrations |
+| C | Run unattended long jobs `(references/long_computation.md`) | Preserves progress and resumability for long runs | Requires stricter planning and run management | Overnight runs, large sweeps, heavy integrations |
 
 ### Primary concerns
 
 It is imperative that you consider the following constraints:
 
--   Any object you create directly in the console is temporary; it expires after each send cycle.
+-   Any object you create directly in the console is temporary; it expires after each run cycle.
 -   R functions are slow. Any function you run directly in the console blocks out the user.
 -   R serialization and disk I/O are also slow. Large exports may also block out the user.
 
 Balance the cost of blocking the console with direct analysis (track A) vs. export (track B).
 
-### Fast-track decision
+### Setup sequence (non-negotiable)
 
-Sometimes the task clearly belongs to a certain pattern and the optimal choice is obvious. Decide quickly and move on to step 2.
+Before beginning any analysis, absolutely follow these steps:
 
--   Choose mode A when export is costlier than analysis, i.e. when:
-    -   computations are trivial,
-    -   objects are very large, and/or
-    -   repeated exploration is unlikely.
--   Choose mode B when analysis is costlier than export, i.e. when:
-    -   the task evaluates many alternatives (parameter grids, model variants, plot styles),
-    -   large intermediates have to be generated,
-    -   objects are very small or may be trimmed down to small subsets/fields, and/or
-    -   multiple expensive follow-ups are likely.
--   Choose mode C when extremely expensive computations must run unattended, i.e. when even a cursory look predicts \>30min ETA. Use `references/long-computation.md` if committing to this path.
+1.  Identify the minimum objects/functions needed from live RStudio. Build the smallest possible payload expression from live objects in one call (fewest objects possible).
+2.  Default to using derived tables, vectors, embeddings, metadata slices, or marker results instead of entire assay objects.
+3.  Explicitly examine data dimensions and flag any large cost-determining magnitudes.
+4.  Use `python3 SKILL_DIR/scripts/estimate_export_seconds.py '<payload>'` to estimate ETA for export.
+5.  Expect the most expensive step of your analysis, and run a quick pilot analysis with a small subset of the data. Use `benchmark` option to gather info for estimating ETA of full analysis.
 
 ### Deliberate and discuss
 
-Whenever the choice is not obvious, you must take care to identify the minimum scope of analysis. Discuss the optimal approach with the user. Following are some general recommendations:
+Sometimes the task clearly belongs to a certain pattern and the optimal choice is obvious. Decide quickly and move on to step 2.
 
-1.  Identify the minimum objects/functions needed from live RStudio. Build the smallest possible payload expression from live objects in one call (fewest objects possible).
-2.  Default to exporting derived tables, vectors, embeddings, metadata slices, or marker results instead of entire assay objects.
-3.  Use `bash SKILL_DIR/scripts/estimate_export_seconds.py '<payload>'` to estimate ETA for export.
-4.  Run steps 2-4 with `benchmark` option to generate benchmarks for small pilot analyses and estimate total ETA for analysis.
-5.  Evaluate the estimates. Report and discuss with user if unsure. Consider pivoting to mode C if either mode is untenable.
+-   Choose mode A when analysis is OBVIOUSLY cheap.
+-   Choose mode B when export is OBVIOUSLY cheap.
+-   Choose mode C when BOTH analysis AND export are OBVIOUSLY extremely expensive, i.e. when even a cursory look predicts \>30min ETA. Use `references/long-computation.md` if committing to this path.
 
-### Extremely expensive computations (mode C)
-
-Use `references/long-computation.md` as the operational playbook for Mode C. It requires careful planning that involves pilot, calibration, unattended launch, checkpointing stages, as well as handoff constraints.
+Whenever the choice is not obvious, you must take care to identify the minimum scope of analysis. Report your estimates and discuss the optimal approach with the user.
 
 ## Step 2. Begin command-building shell
 
@@ -76,113 +67,164 @@ Use `references/long-computation.md` as the operational playbook for Mode C. It 
 -   For every escalated script call, always provide `prefix_rule=["python3","SKILL_DIR/scripts/interact_with_rstudio.py"]`; never include runtime flags/code in the prefix rule.
 -   For interactive bridge sessions in Codex, use `tty=true` so one persistent session id can be reused with `write_stdin` polling.
 -   Do not use `printf` with pipes or heredoc mode.
--   Before complex payloads, run `smoke` once to confirm bridge responsiveness and output transport.
+-   Before complex payloads, run `<<smoke>>` once to confirm bridge responsiveness and output transport.
+-   Exit the interactive bridge with `<<quit>>`.
 
 ## Step 3. Write code
 
+### Style guide
+
+Here is the most important thing you should remember: DO NOT TRUST YOUR CODE.
+
+-   Pessimistically assume every statement contains at least one syntax error.
+-   The longer and nested the code, the more painful the inevitable debugging.
+-   Keep each line short (prefer \<=120 chars); split long logic across multiple lines.
+-   Write code like you're a conceptual expert yet a syntactical baby; avoid complexity like the plague.
+
 ### Quick reference
 
-Once you are in the interactive command-building shell, you can exert the following capabilities to build R code. Each capability amounts to a structured input to stdin.
+Once you are in the interactive command-building shell, you can exert the following capabilities to build R code. Each capability uses a leading `<<keyword>>` command prefix (except bare APPEND lines).
 
 | Capability | Purpose | Scope | Approval |
 |------------------|------------------|------------------|------------------|
-| RESULT (`result:<R expression>`) | Return one expression value via file transport | Temporary execution scope with global read access | Not required |
-| APPEND (`append:<R statement>`) | Stage helper statements for one invocation | Temporary scratch env | Not required |
-| EXPORT (`export:<R expression>`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Not required |
-| CREATE (`create:<name>:=<expr>`) | Create new persistent `.GlobalEnv` binding | Global | Required |
-| MODIFY (`modify:<R statement>`) | Mutate existing persistent state | Global | Required |
+| RESULT (`<<result>>EXPR`) | Set one expression value that will be returned this run | Temporary execution scope with global read access | Not required |
+| APPEND (bare R statement without command prefix) | Stage helper statements. Primary vehicle for adding code | Temporary scratch env | Not required |
+| EXPORT (`<<export>>EXPR`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Not required |
+| CREATE (`<<create>>NAME:=EXPR`) | Create new persistent `.GlobalEnv` binding | Global | Required |
+| MODIFY (`<<modify>>STMT`) | Mutate existing persistent state | Global | Required |
 
-### RESULT (`result:<R expression>`)
+### RESULT (`<<result>>EXPR`)
 
-Use for one final read-only expression.
+Use for one final read-only expression. Each run includes at most one `<<run>>`.
 
--   Only one single-line expression, no assignments (`<-` prohibited!).
--   Do not place multi-line blocks (`{...}`), loops, or function definitions in `result:`. Stage those in `append:` first.
+-   `<<result>>` is strict: exactly one physical line with one complete expression; no assignments (`<-` prohibited).
+-   Do not place multi-line blocks (`{...}`), loops, or function definitions in `<<result>>`. Stage those with APPEND first.
+-   Do not split a `<<result>>...` expression across multiple input lines. Any later lines are treated as APPEND and will break intent.
+-   If `<<result>>` ends with an operator/comma/open delimiter (for example `<<result>>list(`), the bridge rejects it as incomplete before `<<run>>`.
 -   Multi-step prep goes in APPEND.
 -   Skip if `benchmark` option is on; result is automatically set to elapsed time.
 
 Example:
 
 ```         
-result:class(project_obj$sample_01)
-send
+res <- class(project_obj$sample_01)
+<<result>>res
+<<run>>
 ```
 
-### APPEND (`append:<R statement>`)
+Anti-pattern (invalid):
 
-Use for temporary setup and single-shot probing.
+```         
+<<result>>list(
+a = sapply(
+    vec,
+    \(i) i + 1
+  )
+)
+<<run>>
+```
 
--   Objects created here expire with the send-cycle.
+Anti-pattern (valid, but strongly discouraged):
+
+```         
+<<result>>list(a = sapply(vec, my_func))
+```
+
+Preferred pattern:
+
+```         
+tmp <- vec
+tmp2 <- sapply(tmp, my_func)
+<<result>>tmp2
+<<run>>
+```
+
+### APPEND (bare R statement without command prefix)
+
+Main workhorse for building code; type plain R statements with no command prefix.
+
+-   Objects created here expire with the run-cycle.
 -   Avoid repeated console interactions for iterative debugging.
 -   Do not run exploratory loops that emit many plots in live RStudio by default.
 -   For plot-selection tasks, reserve live `print(...)` for the final selected plot unless user explicitly requests live comparisons.
--   Keep each `append:` line short (prefer \<=120 chars); split long logic across multiple lines to reduce transport/parser fragility.
 
 ```         
-append:obj <- project_obj$sample_01
-append:plot_obj <- Seurat::DimPlot(obj)
-result:head(plot_obj$data$colour)
-send
+obj <- project_obj$sample_01
+plot_obj <- Seurat::DimPlot(obj)
+res <- head(plot_obj$data$colour)
+<<result>>res
+<<run>>
 ```
 
 Special example: when plots must be visible to the user, make sure to use `print(...)` around calls that return plot objects (ggplot2/patchwork/Seurat plot builders).
 
 ```         
-append:obj <- project_obj$sample_01
-append:print(Seurat::DimPlot(obj))
-send
+obj <- project_obj$sample_01
+print(Seurat::DimPlot(obj))
+<<run>>
 ```
 
-### EXPORT (`export:<R expression>`)
+### EXPORT (`<<export>>EXPR`)
 
 Use when follow-up is likely. Script returns a path to the exported RDS.
 
 Example:
 
 ```         
-append:snap_obj <- project_obj$sample_01
-export:list(sample_obj = snap_obj, created = Sys.time())
-send
+snap_obj <- project_obj$sample_01
+res <- list(sample_obj = snap_obj, created = Sys.time())
+<<export>>res
+<<run>>
 ```
 
-### CREATE (`create:<name>:=<expr>`)
+### CREATE (`<<create>>NAME:=EXPR`)
 
 Use only for explicit user-requested persistent `.GlobalEnv` binding changes.
 
-### MODIFY (`modify:<R statement>`)
+Example:
+
+```         
+obj <- project_obj$sample_01
+res1 <- FindNeighbors(obj)
+res2 <- RunUMAP(obj)
+<<create>>sample_01_processed:=res2
+<<run>>
+```
+
+### MODIFY (`<<modify>>STMT`)
 
 Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 
 ## Step 4. Apply options
 
-Options are also set interactively using stdin. Use `<option-name>:<value>.`
+Options are also set interactively using stdin. Use `<<option-name>>VALUE`.
 
 -   Timeout-related options: set both explicitly on long or uncertain calls. Ttilize `est_seconds` = ETA computed in step 1 if in mode B.
-    -   `timeout:<seconds>`: pertains to result-file wait. Should be at least `est_seconds + 90`.
-    -   `rpc-timeout:<seconds>`: pertains to send step. Should be at least `est_seconds`.
+    -   `<<timeout>>SECONDS`: pertains to result-file wait. Should be at least `est_seconds + 90`.
+    -   `<<rpc-timeout>>SECONDS`: pertains to run step. Should be at least `est_seconds`.
 -   Connection-related options: do not manually overwrite `RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, or `RSTUDIO_SESSION_PID` during normal operation. `interact_with_rstudio.py` already prefers valid live runtime env vars and only falls back to `suspended-session-data/environment_vars` when needed.
-    -   `session-dir:<dir>`: Override auto session discovery and target one explicit RStudio session directory.
-    -   `id:<int>`: Set JSON-RPC request id (mainly for tracing/debugging); default is `1`.
-    -   `rpostback-bin:<path>`: Override `rpostback` binary path for troubleshooting custom/runtime layouts.
--   `out:<path>`: Use a fixed result file path instead of an auto-generated temp file when `result:` or `export:` is set.
--   `benchmark:<on|off>`: Benchmark mode for `result:`; returns elapsed time (not the expression value).
--   `benchmark-unit:<seconds|ms>`: Unit for benchmark output.
--   `print-code:<on|off>`: Print generated R snippet to stderr before RPC send.
+    -   `<<session-dir>>DIR`: Override auto session discovery and target one explicit RStudio session directory.
+    -   `<<id>>INT`: Set JSON-RPC request id (mainly for tracing/debugging); default is `1`.
+    -   `<<rpostback-bin>>PATH`: Override `rpostback` binary path for troubleshooting custom/runtime layouts.
+-   `<<out>>PATH`: Use a fixed result file path instead of an auto-generated temp file when `<<result>>` or `<<export>>` is set.
+-   `<<benchmark>>ON|OFF`: Benchmark mode for `<<result>>`; returns elapsed time (not the expression value).
+-   `<<benchmark-unit>>SECONDS|MS`: Unit for benchmark output.
+-   `<<print-code>>ON|OFF`: Print generated R snippet to stderr before RPC run.
 
-Finally, `send` the finished R-code.
+Finally, `<<run>>` the finished R-code.
 
--   Critical: `append:`, `result:`, `export:`, `create:`, and `modify` are only stage capabilities. Nothing executes until `send`.
+-   Critical: APPEND, RESULT, EXPORT, CREATE, and MODIFY are only stage capabilities. Nothing executes until `<<run>>`.
 
--   After every `send` attempt (success or failure), the bridge clears staged capabilities. Re-stage lines explicitly for the next batch.
+-   After every `<<run>>` attempt (success or failure), the bridge clears staged capabilities. Re-stage lines explicitly for the next batch.
 
--   Treat tool `yield_time_ms` as output polling only, not cancellation. Keep a single live `interact_with_rstudio.py` exec session per run, poll that same session while `send` is in flight, and do not start another `send`/process until the prior one returns.
+-   Treat tool `yield_time_ms` as output polling only, not cancellation. Keep a single live `interact_with_rstudio.py` exec session per run, poll that same session while `<<run>>` is in flight, and do not start another `<<run>>`/process until the prior one returns.
 
 ## Step 5. Interpret output
 
 Bridge output interpretation:
 
 -   Success returns a structured payload with `result`, `stdout`, and `stderr`.
--   `append:`-only sends are treated as success with implicit `result = NULL` plus captured `stdout`/`stderr`.
+-   APPEND-only runs are treated as success with implicit `result = NULL` plus captured `stdout`/`stderr`.
 -   Failure returns a structured payload with `error`, `stdout`, and `stderr`.
 -   `stdout` can be noisy and non-empty on successful runs (for example from `print(...)`).
 -   Treat parse failures (`__SYNTAX_ERROR__`), RPC failures, and explicit `error` payloads as actual failures.
@@ -227,9 +269,9 @@ Run these checks for every line of code you write.
 -   Avoid complex one-liner construction like giant `list(...)` or heavy inline indexing in one command.
 -   Avoid semicolon-separated multi-statement lines and deeply nested expressions.
 -   Strongly prefer explicit intermediate variables and short commands that are easy to debug.
--   Keep one action per line in both `append:` and background R commands.
+-   Keep one action per line in both append and background R commands.
 -   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
--   If a `send` unexpectedly fails, run `smoke`, then use `show` to verify staged capabilities before retrying.
+-   If `<<run>>` unexpectedly fails, run `<<smoke>>`, then use `<<show>>` to verify staged capabilities before retrying.
 
 ### Important reminder
 

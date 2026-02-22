@@ -18,7 +18,7 @@ def usage() -> str:
         "    max(5, ceiling(0.5 * size_in_MB + 10))\n\n"
         "Examples:\n"
         "  estimate_export_seconds.py 'total'\n"
-        "  estimate_export_seconds.py --timeout 120 --rpc-timeout 120 'list(meta = total@meta.data)'\n"
+        "  estimate_export_seconds.py --timeout 120 --rpc-timeout 120 'list(meta = total[[\"meta.data\"]])'\n"
     )
 
 

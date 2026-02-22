@@ -11,9 +11,9 @@ Use this reference when `interact_with_rstudio.sh` or its RPC helper fails.
 
 ## Common Failures
 
-### `RPC send timed out after <n>s.`
+### `RPC dispatch timed out after <n>s.`
 
-Hard timeout fired while sending to RStudio.
+Hard timeout fired while dispatching to RStudio.
 
 1.  Check for lingering wrapper processes and stop them before retrying.
 2.  Assume the call was too heavy unless proven otherwise.
@@ -29,7 +29,7 @@ Treat this as a stale snapshot signal first, not mandatory user refresh.
 
 ### `Timed out waiting for result file: ...`
 
-RPC send returned, but no result payload arrived before `--timeout`.
+RPC dispatch returned, but no result payload arrived before `--timeout`.
 
 1.  Read `Timeout diagnostics: causes=...`.
 2.  Apply cause-specific action
@@ -73,7 +73,7 @@ Rerun the same single-segment command with escalation.
 
 -   If the message is `no applicable method for 'conditionMessage' applied to an object of class "character"`, the bridge is seeing a non-condition error payload.
 
--   Retry with `print-code:on` once, then patch the interactive code path with a helper that coalesces condition messages with `as.character` for non-condition objects.
+-   Retry with `<<print-code>>on` once, then patch the interactive code path with a helper that coalesces condition messages with `as.character` for non-condition objects.
 
 ### `Result expression cannot contain '<-' assignment.`
 

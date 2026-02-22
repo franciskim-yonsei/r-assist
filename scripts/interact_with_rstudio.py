@@ -15,7 +15,7 @@ class ValidationError(Exception):
     pass
 
 
-class SendError(Exception):
+class RunError(Exception):
     pass
 
 
@@ -29,6 +29,32 @@ COMMON_BLOCKED_PATTERNS = [
 APPEND_FILE_BLOCKED_PATTERNS = [
     r"(^|[^A-Za-z0-9_.])(write|writeLines|write\.csv|write\.csv2|write\.delim|write\.delim2|write\.table|fwrite|cat|saveRDS|save|load|file\.create|dir\.create|unlink|file\.remove|file\.rename|file\.copy|file\.append|download\.file|png|jpeg|svg|bmp|tiff|pdf|postscript|quartz|x11)\s*\(",
 ]
+
+LIKELY_INCOMPLETE_SUFFIX_PATTERN = re.compile(
+    r"("
+    r","
+    r"|\("
+    r"|\["
+    r"|\{"
+    r"|::"
+    r"|:::"
+    r"|\|>"
+    r"|&&"
+    r"|\|\|"
+    r"|=="
+    r"|!="
+    r"|<="
+    r"|>="
+    r"|<-"
+    r"|->"
+    r"|="
+    r"|[+\-*/^$&|~:?!]"
+    r"|\x40"
+    r"|%[^%]*%"
+    r")\s*$"
+)
+
+COMMAND_PREFIX_PATTERN = re.compile(r"^\s*<<([A-Za-z][A-Za-z0-9-]*)>>(.*)$")
 
 
 @dataclass
@@ -46,7 +72,7 @@ class State:
     timeout_seconds: str = "8"
     rpc_timeout_seconds: str = "12"
     benchmark_mode: bool = False
-    benchmark_unit: str = "seconds"
+    benchmark_unit: str = "SECONDS"
     print_code: bool = False
 
     def clear_capabilities(self) -> None:
@@ -57,14 +83,37 @@ class State:
         self.modify_global_snippets = []
         self.benchmark_mode = False
 
-
 @dataclass
-class SendContext:
+class RunContext:
     expect_result: bool
     out_path: str
     is_temp_out_path: bool
     state_export_path: str
     append_only: bool
+
+
+KNOWN_PREFIXES = {
+    "smoke",
+    "show",
+    "clear",
+    "help",
+    "quit",
+    "run",
+    "append",
+    "result",
+    "export",
+    "create",
+    "modify",
+    "session-dir",
+    "id",
+    "rpostback-bin",
+    "out",
+    "timeout",
+    "rpc-timeout",
+    "benchmark",
+    "benchmark-unit",
+    "print-code",
+}
 
 
 def trim(value: str) -> str:
@@ -112,6 +161,111 @@ def validate_append_file_restrictions(code: str) -> None:
             raise ValidationError("APPEND_CODE may not write files.")
 
 
+def has_unbalanced_delimiters_or_quotes(value: str) -> bool:
+    stack: List[str] = []
+    in_single = False
+    in_double = False
+    in_backtick = False
+    escaped = False
+
+    matching = {")": "(", "]": "[", "}": "{"}
+
+    for ch in value:
+        if (in_single or in_double) and escaped:
+            escaped = False
+            continue
+        if (in_single or in_double) and ch == "\\":
+            escaped = True
+            continue
+
+        if not in_double and not in_backtick and ch == "'":
+            in_single = not in_single
+            continue
+        if not in_single and not in_backtick and ch == '"':
+            in_double = not in_double
+            continue
+        if not in_single and not in_double and ch == "`":
+            in_backtick = not in_backtick
+            continue
+
+        if in_single or in_double or in_backtick:
+            continue
+
+        if ch in "([{":
+            stack.append(ch)
+            continue
+        if ch in ")]}":
+            if not stack or stack[-1] != matching[ch]:
+                return True
+            stack.pop()
+
+    if in_single or in_double or in_backtick:
+        return True
+    return bool(stack)
+
+
+def has_statement_separator_semicolon(value: str) -> bool:
+    in_single = False
+    in_double = False
+    in_backtick = False
+    escaped = False
+
+    for ch in value:
+        if (in_single or in_double) and escaped:
+            escaped = False
+            continue
+        if (in_single or in_double) and ch == "\\":
+            escaped = True
+            continue
+
+        if not in_double and not in_backtick and ch == "'":
+            in_single = not in_single
+            continue
+        if not in_single and not in_backtick and ch == '"':
+            in_double = not in_double
+            continue
+        if not in_single and not in_double and ch == "`":
+            in_backtick = not in_backtick
+            continue
+
+        if in_single or in_double or in_backtick:
+            continue
+
+        if ch == "#":
+            break
+        if ch == ";":
+            return True
+
+    return False
+
+
+def validate_single_line_expression_contract(expr: str, capability: str) -> str:
+    normalized = trim(expr)
+    if not normalized:
+        raise ValidationError(f"<<{capability}>> cannot be empty.")
+    if "\n" in expr or "\r" in expr:
+        raise ValidationError(
+            f"<<{capability}>> must be exactly one physical line. "
+            f"Use APPEND for setup, then keep <<{capability}>> as one complete expression."
+        )
+    if has_statement_separator_semicolon(normalized):
+        raise ValidationError(
+            f"<<{capability}>> must contain one expression only; semicolons outside string literals are not allowed. "
+            "Use APPEND for multi-step setup."
+        )
+    if LIKELY_INCOMPLETE_SUFFIX_PATTERN.search(normalized):
+        raise ValidationError(
+            f"<<{capability}>> payload looks incomplete (it ends with an operator, comma, or opening delimiter). "
+            f"Use APPEND for setup, then keep <<{capability}>> as one complete expression."
+        )
+    if has_unbalanced_delimiters_or_quotes(normalized):
+        raise ValidationError(
+            f"<<{capability}>> payload looks incomplete (unbalanced delimiters or quotes). "
+            f"Use APPEND for setup, then keep <<{capability}>> as one complete expression."
+        )
+    return normalized
+
+
 def validate_assignment_free(code: str, label: str) -> None:
     if contains_regex(code, r"<-"):
         raise ValidationError(f"{label} cannot contain '<-' assignment.")
@@ -153,22 +307,18 @@ def validate_append_snippet(snippet: str) -> None:
     validate_append_file_restrictions(snippet)
 
 
-def validate_result_expr(expr: str) -> None:
-    if not trim(expr):
-        raise ValidationError("result cannot be empty.")
-    if "\n" in expr:
-        raise ValidationError("result must be one line.")
+def validate_result_expr(expr: str) -> str:
+    normalized = validate_single_line_expression_contract(expr, "result")
     validate_common_blocklist(expr, "Result expression")
     validate_assignment_free(expr, "Result expression")
+    return normalized
 
 
-def validate_state_export_expr(expr: str) -> None:
-    if not trim(expr):
-        raise ValidationError("export cannot be empty.")
-    if "\n" in expr:
-        raise ValidationError("export must be one line.")
+def validate_state_export_expr(expr: str) -> str:
+    normalized = validate_single_line_expression_contract(expr, "export")
     validate_common_blocklist(expr, "R_STATE_EXPORT expression")
     validate_assignment_free(expr, "R_STATE_EXPORT expression")
+    return normalized
 
 
 def validate_modify_global_snippet(snippet: str) -> None:
@@ -226,7 +376,7 @@ def resolve_session_dir(state: State) -> Path:
     if state.session_dir:
         session_dir = Path(state.session_dir)
         if not (session_dir / "session-persistent-state").exists():
-            raise SendError(f"Specified session-dir is missing session-persistent-state: {session_dir}")
+            raise RunError(f"Specified session-dir is missing session-persistent-state: {session_dir}")
         return session_dir
 
     current_pid = os.environ.get("RSTUDIO_SESSION_PID", "")
@@ -245,7 +395,7 @@ def resolve_session_dir(state: State) -> Path:
         if (candidate / "session-persistent-state").exists():
             return candidate
 
-    raise SendError("Unable to locate an active RStudio session state file.")
+    raise RunError("Unable to locate an active RStudio session state file.")
 
 
 def apply_env_file(env_file: Path) -> None:
@@ -393,6 +543,13 @@ def parse_bool(value: str) -> bool:
     raise ValidationError(f"Invalid boolean value: {value!r}")
 
 
+def parse_benchmark_unit(value: str) -> str:
+    normalized = value.strip().upper()
+    if normalized not in {"SECONDS", "MS"}:
+        raise ValidationError("benchmark-unit must be either 'SECONDS' or 'MS'.")
+    return normalized
+
+
 def ensure_int_string(value: str, label: str) -> None:
     if re.fullmatch(r"\d+", value) is None:
         raise ValidationError(f"{label} must be an integer.")
@@ -439,7 +596,7 @@ def build_prompt(state: State) -> str:
     return f"rstudio-bridge[pending={pending},result={result_set},export={export_set}]> "
 
 
-def validate_state_for_send(state: State) -> SendContext:
+def validate_state_for_run(state: State) -> RunContext:
     has_append = bool(state.append_code_snippets)
     has_result = bool(state.result_expr)
     has_export = bool(state.state_export_expr)
@@ -457,8 +614,7 @@ def validate_state_for_send(state: State) -> SendContext:
                 "export cannot be combined with result, create, or modify."
             )
 
-    if state.benchmark_unit not in {"seconds", "ms"}:
-        raise ValidationError("benchmark-unit must be either 'seconds' or 'ms'.")
+    state.benchmark_unit = parse_benchmark_unit(state.benchmark_unit)
 
     if state.benchmark_mode:
         if not state.result_expr:
@@ -504,7 +660,7 @@ def validate_state_for_send(state: State) -> SendContext:
         os.close(fd)
         state_export_path = tmp
 
-    return SendContext(
+    return RunContext(
         expect_result=expect_result,
         out_path=out_path,
         is_temp_out_path=is_temp_out_path,
@@ -520,7 +676,7 @@ def find_rpc_script(script_dir: Path) -> Path:
     home_rpc_py = Path.home() / ".codex/skills/r-assist/scripts/communicate_with_rstudio_console_with_rpc_low_level.py"
     if home_rpc_py.exists():
         return home_rpc_py
-    raise SendError("Unable to locate communicate_with_rstudio_console_with_rpc_low_level.py")
+    raise RunError("Unable to locate communicate_with_rstudio_console_with_rpc_low_level.py")
 
 
 def check_r_code_parse(r_code: str, expect_result: bool, out_path: str) -> None:
@@ -568,7 +724,7 @@ def check_r_code_parse(r_code: str, expect_result: bool, out_path: str) -> None:
             pass
 
 
-def build_r_code(state: State, send_ctx: SendContext) -> str:
+def build_r_code(state: State, run_ctx: RunContext) -> str:
     r_exec_lines: List[str] = []
     r_create_lines: List[str] = []
     r_modify_lines: List[str] = []
@@ -583,7 +739,7 @@ def build_r_code(state: State, send_ctx: SendContext) -> str:
             r_exec_lines.append(
                 f'.codex_result_expr <- tryCatch({{ invisible(({state.result_expr})); proc.time()[["elapsed"]] - .codex_bench_t0 }}, error = function(e) e)'
             )
-            if state.benchmark_unit == "ms":
+            if state.benchmark_unit == "MS":
                 r_exec_lines.append('if (!inherits(.codex_result_expr, "error")) .codex_result_expr <- .codex_result_expr * 1000')
         else:
             r_exec_lines.append(
@@ -591,7 +747,7 @@ def build_r_code(state: State, send_ctx: SendContext) -> str:
             )
 
     if state.state_export_expr:
-        escaped_state_path = escape_for_r_string(send_ctx.state_export_path)
+        escaped_state_path = escape_for_r_string(run_ctx.state_export_path)
         r_exec_lines.append(f'.codex_state_export_path <- "{escaped_state_path}"')
         r_exec_lines.append(f'.codex_state_payload <- ({state.state_export_expr})')
         r_exec_lines.append('saveRDS(.codex_state_payload, file = .codex_state_export_path, compress = "xz")')
@@ -622,13 +778,13 @@ def build_r_code(state: State, send_ctx: SendContext) -> str:
     r_modify_block = join_lines(r_modify_lines)
 
     out_path_escaped = ""
-    if send_ctx.expect_result:
-        out_path_escaped = escape_for_r_string(send_ctx.out_path)
+    if run_ctx.expect_result:
+        out_path_escaped = escape_for_r_string(run_ctx.out_path)
 
     r_code = ""
     r_code += '.codex_before <- ls(envir = .GlobalEnv, all.names = TRUE)\n'
     r_code += f'.codex_allowed_added <- c({r_allowed_added})\n'
-    r_code += f'.codex_append_only <- {"TRUE" if send_ctx.append_only else "FALSE"}\n'
+    r_code += f'.codex_append_only <- {"TRUE" if run_ctx.append_only else "FALSE"}\n'
     r_code += f'.codex_result_out_path <- "{out_path_escaped}"\n'
     r_code += '.codex_captured_stdout <- character(0)\n'
     r_code += '.codex_captured_stderr <- character(0)\n'
@@ -663,7 +819,7 @@ def build_r_code(state: State, send_ctx: SendContext) -> str:
     r_code += '  .codex_exec_error <<- e\n'
     r_code += '})\n'
 
-    if send_ctx.expect_result:
+    if run_ctx.expect_result:
         r_code += 'if (!is.null(.codex_exec_error)) {\n'
         r_code += '  dput(list(error = .codex_msg(.codex_exec_error), stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
         r_code += '  .codex_result_written <- TRUE\n'
@@ -699,7 +855,7 @@ def build_r_code(state: State, send_ctx: SendContext) -> str:
     return r_code
 
 
-def run_rpc_send(rpc_script: Path, rpc_args: List[str], suppress_stdout: bool, rpc_timeout_seconds: str) -> int:
+def run_rpc_dispatch(rpc_script: Path, rpc_args: List[str], suppress_stdout: bool, rpc_timeout_seconds: str) -> int:
     cmd = ["python3", str(rpc_script)] + rpc_args
     use_timeout = shutil.which("timeout") is not None
 
@@ -724,7 +880,7 @@ def run_rpc_send(rpc_script: Path, rpc_args: List[str], suppress_stdout: bool, r
         print(proc.stderr, file=sys.stderr, end="")
 
     if proc.returncode in {124, 137}:
-        print(f"RPC send timed out after {rpc_timeout_seconds}s.", file=sys.stderr)
+        print(f"RPC dispatch timed out after {rpc_timeout_seconds}s.", file=sys.stderr)
         return 124
 
     return proc.returncode
@@ -733,7 +889,7 @@ def run_rpc_send(rpc_script: Path, rpc_args: List[str], suppress_stdout: bool, r
 def run_low_level_passthrough(argv: List[str], script_dir: Path) -> int:
     try:
         rpc_script = find_rpc_script(script_dir)
-    except SendError as exc:
+    except RunError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -741,23 +897,23 @@ def run_low_level_passthrough(argv: List[str], script_dir: Path) -> int:
     return proc.returncode
 
 
-def send_current_state(state: State, script_dir: Path) -> None:
-    send_ctx = validate_state_for_send(state)
+def execute_run(state: State, script_dir: Path) -> None:
+    run_ctx = validate_state_for_run(state)
     success = False
 
     try:
         session_dir = resolve_session_dir(state)
         load_session_environment(session_dir)
-        r_code = build_r_code(state, send_ctx)
+        r_code = build_r_code(state, run_ctx)
 
-        if send_ctx.append_only:
+        if run_ctx.append_only:
             print(
-                "Warning: APPEND-only send returns implicit result=NULL with captured stdout/stderr. "
-                "Add result:/export:/create:/modify: if you need explicit payloads.",
+                "Warning: APPEND-only run returns implicit result = NULL with captured stdout/stderr. "
+                "Add <<result>>/<<export>>/<<create>>/<<modify>> if you need explicit payloads.",
                 file=sys.stderr,
             )
 
-        check_r_code_parse(r_code, send_ctx.expect_result, send_ctx.out_path)
+        check_r_code_parse(r_code, run_ctx.expect_result, run_ctx.out_path)
 
         if state.print_code:
             print("Generated R code:", file=sys.stderr)
@@ -779,25 +935,25 @@ def send_current_state(state: State, script_dir: Path) -> None:
         if state.rpostback_bin:
             rpc_args += ["--rpostback-bin", state.rpostback_bin]
 
-        if send_ctx.expect_result:
-            Path(send_ctx.out_path).write_text("", encoding="utf-8")
+        if run_ctx.expect_result:
+            Path(run_ctx.out_path).write_text("", encoding="utf-8")
 
         if not check_session_busy_before_rpc(session_dir):
-            raise SendError("Failed busy precheck.")
+            raise RunError("Failed busy precheck.")
 
-        suppress_stdout = send_ctx.expect_result
-        rc = run_rpc_send(
+        suppress_stdout = run_ctx.expect_result
+        rc = run_rpc_dispatch(
             rpc_script=rpc_script,
             rpc_args=rpc_args,
             suppress_stdout=suppress_stdout,
             rpc_timeout_seconds=state.rpc_timeout_seconds,
         )
         if rc != 0:
-            raise SendError("Failed to send RPC request.")
+            raise RunError("Failed to dispatch RPC request.")
 
-        if send_ctx.expect_result:
+        if run_ctx.expect_result:
             deadline = time.time() + int(state.timeout_seconds)
-            out_file = Path(send_ctx.out_path)
+            out_file = Path(run_ctx.out_path)
             while time.time() < deadline:
                 if out_file.exists() and out_file.stat().st_size > 0:
                     print(out_file.read_text(encoding="utf-8", errors="replace"), end="")
@@ -805,20 +961,20 @@ def send_current_state(state: State, script_dir: Path) -> None:
                 time.sleep(0.2)
 
             if not (out_file.exists() and out_file.stat().st_size > 0):
-                print(f"Timed out waiting for result file: {send_ctx.out_path}", file=sys.stderr)
+                print(f"Timed out waiting for result file: {run_ctx.out_path}", file=sys.stderr)
                 diagnose_result_wait_timeout(out_file, session_dir)
-                raise SendError("Timed out waiting for result file.")
+                raise RunError("Timed out waiting for result file.")
 
         success = True
     finally:
-        if send_ctx.is_temp_out_path and send_ctx.out_path:
+        if run_ctx.is_temp_out_path and run_ctx.out_path:
             try:
-                Path(send_ctx.out_path).unlink()
+                Path(run_ctx.out_path).unlink()
             except OSError:
                 pass
-        if not success and send_ctx.state_export_path:
+        if not success and run_ctx.state_export_path:
             try:
-                Path(send_ctx.state_export_path).unlink()
+                Path(run_ctx.state_export_path).unlink()
             except OSError:
                 pass
 
@@ -826,28 +982,29 @@ def send_current_state(state: State, script_dir: Path) -> None:
 def print_help() -> None:
     print(
         "Commands:\n"
-        "  append:<R statement>          Append statement in scratch env\n"
-        "  result:<R expression>         Set result expression (single line)\n"
-        "  export:<R expression>         Export expression via saveRDS and return file path\n"
-        "  create:<name>:=<expr>         Create new variable in .GlobalEnv\n"
-        "  modify:<R statement>          Evaluate statement in .GlobalEnv\n"
-        "  session-dir:<dir>             Override active RStudio session directory\n"
-        "  id:<int>                      JSON-RPC request id\n"
-        "  rpostback-bin:<path>          Override rpostback binary\n"
-        "  out:<path>                    Result output file\n"
-        "  timeout:<seconds>             Wait timeout for result file\n"
-        "  rpc-timeout:<seconds>         Hard timeout for RPC send step\n"
-        "  benchmark:<on|off>            Benchmark result expression\n"
-        "  benchmark-unit:<seconds|ms>   Unit for benchmark\n"
-        "  print-code:<on|off>           Print generated R snippet to stderr\n"
+        "  <R statement>                 Append statement in scratch env\n"
+        "  <<append>><R statement>       Explicit append statement\n"
+        "  <<result>><R expression>      Set one complete single-line result expression\n"
+        "  <<export>><R expression>      Export expression via saveRDS and return file path\n"
+        "  <<create>><name>:=<expr>      Create new variable in .GlobalEnv\n"
+        "  <<modify>><R statement>       Evaluate statement in .GlobalEnv\n"
+        "  <<session-dir>><dir>          Override active RStudio session directory\n"
+        "  <<id>><int>                   JSON-RPC request id\n"
+        "  <<rpostback-bin>><path>       Override rpostback binary\n"
+        "  <<out>><path>                 Result output file\n"
+        "  <<timeout>><seconds>          Wait timeout for result file\n"
+        "  <<rpc-timeout>><seconds>      Hard timeout for run dispatch\n"
+        "  <<benchmark>><ON|OFF>         Benchmark result expression (case-insensitive)\n"
+        "  <<benchmark-unit>><SECONDS|MS> Unit for benchmark (case-insensitive)\n"
+        "  <<print-code>><ON|OFF>        Print generated R snippet to stderr (case-insensitive)\n"
         "\n"
         "Control:\n"
-        "  smoke                          Run a minimal bridge health check send\n"
-        "  show                           Show current accumulated state\n"
-        "  clear                          Clear accumulated capabilities\n"
-        "  send                           Validate/build/send accumulated request\n"
-        "  help                           Show this help\n"
-        "  quit                           Exit\n"
+        "  <<smoke>>                     Run a minimal bridge health check\n"
+        "  <<show>>                      Show current accumulated state\n"
+        "  <<clear>>                     Clear accumulated capabilities\n"
+        "  <<run>>                       Validate/build/run accumulated request\n"
+        "  <<help>>                      Show this help\n"
+        "  <<quit>>                      Exit\n"
     )
 
 
@@ -870,55 +1027,68 @@ def show_state(state: State) -> None:
     print(f"  print-code: {'on' if state.print_code else 'off'}")
 
 
+def split_capability_line(line: str) -> Tuple[str, str]:
+    stripped = line.lstrip()
+    if not stripped.startswith("<<"):
+        return "", line
+
+    match = COMMAND_PREFIX_PATTERN.match(line)
+    if match is None:
+        raise ValidationError(
+            "Malformed command prefix. Use <<keyword>><payload> or plain R lines for APPEND."
+        )
+
+    key = match.group(1).lower()
+    payload = match.group(2)
+    if key == "exit":
+        raise ValidationError("<<exit>> is no longer supported. Use <<quit>>.")
+    if key not in KNOWN_PREFIXES:
+        raise ValidationError(f"Unknown command prefix: {key}. Use <<help>> for available commands.")
+    return key, payload
+
+
 def apply_input_line(state: State, line: str) -> Optional[str]:
     normalized = line.strip()
     if not normalized:
         return None
 
-    if normalized in {"help", "?"}:
-        print_help()
+    key, payload = split_capability_line(line)
+    if not key:
+        validate_append_snippet(line)
+        state.append_code_snippets.append(line)
         return None
 
-    if normalized == "show":
-        show_state(state)
-        return None
-
-    if normalized == "clear":
-        state.clear_capabilities()
-        print("Cleared accumulated capabilities.")
-        return None
-
-    if normalized == "smoke":
-        if pending_capability_count(state) > 0:
-            raise ValidationError("smoke requires no pending capabilities. Use clear first.")
-        state.result_expr = 'paste("bridge_ok", format(Sys.time(), "%Y-%m-%d %H:%M:%S"))'
-        return "send"
-
-    if normalized == "send":
-        return "send"
-
-    if normalized in {"quit", "exit"}:
-        return "quit"
-
-    if ":" not in line:
-        raise ValidationError("Input must be '<prefix>:<payload>' or a control command.")
-
-    prefix, payload = line.split(":", 1)
-    key = prefix.strip().lower()
-
-    if key in {"append", "append-code"}:
+    if key == "append":
         validate_append_snippet(payload)
         state.append_code_snippets.append(payload)
-    elif key in {"result", "set-result-expr"}:
-        validate_result_expr(payload)
-        state.result_expr = payload
-    elif key in {"export", "r-state-export"}:
-        validate_state_export_expr(payload)
-        state.state_export_expr = payload
-    elif key in {"create", "create-global-variable"}:
+    elif key in {"help", "show", "clear", "smoke", "run", "quit"}:
+        if payload.strip():
+            raise ValidationError(f"{key} does not take a payload.")
+        if key == "help":
+            print_help()
+            return None
+        if key == "show":
+            show_state(state)
+            return None
+        if key == "clear":
+            state.clear_capabilities()
+            print("Cleared accumulated capabilities.")
+            return None
+        if key == "smoke":
+            if pending_capability_count(state) > 0:
+                raise ValidationError("smoke requires no pending capabilities. Use <<clear>> first.")
+            state.result_expr = 'paste("bridge_ok", format(Sys.time(), "%Y-%m-%d %H:%M:%S"))'
+            return "run"
+        if key in {"run", "quit"}:
+            return key
+    elif key == "result":
+        state.result_expr = validate_result_expr(payload)
+    elif key == "export":
+        state.state_export_expr = validate_state_export_expr(payload)
+    elif key == "create":
         validate_name_expr_spec(payload, "create")
         state.create_global_specs.append(payload)
-    elif key in {"modify", "modify-global-env"}:
+    elif key == "modify":
         validate_modify_global_snippet(payload)
         state.modify_global_snippets.append(payload)
     elif key == "session-dir":
@@ -939,14 +1109,11 @@ def apply_input_line(state: State, line: str) -> Optional[str]:
     elif key == "benchmark":
         state.benchmark_mode = parse_bool(payload)
     elif key == "benchmark-unit":
-        value = payload.strip()
-        if value not in {"seconds", "ms"}:
-            raise ValidationError("benchmark-unit must be either 'seconds' or 'ms'.")
-        state.benchmark_unit = value
+        state.benchmark_unit = parse_benchmark_unit(payload)
     elif key == "print-code":
         state.print_code = parse_bool(payload)
     else:
-        raise ValidationError(f"Unknown input prefix: {prefix}")
+        raise ValidationError(f"Unknown input prefix: {key}")
 
     return None
 
@@ -959,7 +1126,7 @@ def repl() -> int:
     state = State()
     script_dir = Path(__file__).resolve().parent
 
-    print("interactive_rstudio_bridge ready. Type 'help' for commands.")
+    print("interactive_rstudio_bridge ready. Type '<<help>>' for commands.")
     while True:
         try:
             line = input(build_prompt(state))
@@ -974,20 +1141,20 @@ def repl() -> int:
             action = apply_input_line(state, line)
             if action == "quit":
                 return 0
-            if action == "send":
-                send_succeeded = False
+            if action == "run":
+                run_succeeded = False
                 try:
-                    send_current_state(state, script_dir)
-                    send_succeeded = True
+                    execute_run(state, script_dir)
+                    run_succeeded = True
                 finally:
                     state.clear_capabilities()
-                if send_succeeded:
-                    print("Send completed; capability state cleared.")
+                if run_succeeded:
+                    print("Run completed; capability state cleared.")
                 else:
-                    print("Send failed; capability state cleared.", file=sys.stderr)
+                    print("Run failed; capability state cleared.", file=sys.stderr)
         except ValidationError as exc:
             print(str(exc), file=sys.stderr)
-        except SendError as exc:
+        except RunError as exc:
             print(str(exc), file=sys.stderr)
         except Exception as exc:  # defensive catch for loop resilience
             print(f"Unexpected error: {exc}", file=sys.stderr)
