@@ -17,7 +17,7 @@ Interrogate live RStudio session via `python3 SKILL_DIR/scripts/interact_with_rs
 4.  Apply appropriate options, then run the code.
 5.  Inspect output and iterate.
 6.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
-7.  If the user expects live output, return only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
+7.  Present report. Strongly consider visualizing key arguments.
 
 ## Step 1. Decide mode of operation
 
@@ -85,18 +85,18 @@ Here is the most important thing you should remember: DO NOT TRUST YOUR CODE.
 
 Once you are in the interactive command-building shell, you can exert the following capabilities to build R code. Each capability uses a leading `<<keyword>>` command prefix (except bare APPEND lines).
 
-| Capability | Purpose | Scope | Approval |
+| Capability | Purpose | Scope | Required beforehand |
 |------------------|------------------|------------------|------------------|
-| PREVIEW (`<<preview>>EXPR`) | Return a conservative, short summary for one expression | Temporary execution scope with global read access | Not required |
-| RESULT (`<<result>>EXPR`) | Set one expression value that will be returned this run | Temporary execution scope with global read access | Not required |
-| APPEND (bare R statement without command prefix) | Stage helper statements. Primary vehicle for adding code | Temporary scratch env | Not required |
-| EXPORT (`<<export>>EXPR`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Not required |
-| CREATE (`<<create>>NAME:=EXPR`) | Create new persistent `.GlobalEnv` binding | Global | Required |
-| MODIFY (`<<modify>>STMT`) | Mutate existing persistent state | Global | Required |
+| PREVIEW (`<<preview>>EXPR`) | Return a conservative, short summary for one expression | Temporary execution scope with global read access | None |
+| APPEND (bare R statement without command prefix) | Stage helper statements. Primary vehicle for adding code | Temporary scratch env | Estimate computational cost and plan ahead |
+| RESULT (`<<result>>EXPR`) | Set one expression value that will be returned this run | Temporary execution scope with global read access | Inspect object size, dimensions, and class; beware serialization |
+| EXPORT (`<<export>>EXPR`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Estimate export time, evaluated and discuss with user |
+| CREATE (`<<create>>NAME:=EXPR`) | Create new persistent `.GlobalEnv` binding | Global | Obtain explicit user approval |
+| MODIFY (`<<modify>>STMT`) | Mutate existing persistent state | Global | Double-check even after user approval |
 
 ### PREVIEW (`<<preview>>EXPR`)
 
-Default to this capability for read-only inspection. `<<preview>>` is conservative by design: it returns compact metadata plus a bounded text preview (for example from `show(...)` for formal/S4 objects or `str(..., max.level = 1)` for other objects), with explicit truncation limits.
+Default to this capability for read-only inspection. `<<preview>>` is conservative by design: it returns compact metadata plus a bounded text preview (`show(...)` for formal/S4 objects or `str(..., max.level = 1)` for other objects), with explicit truncation limits.
 
 -   Use `<<preview>>` first unless exact value transport is truly necessary.
 -   `<<preview>>` is strict: exactly one physical line with one complete expression; no assignments (`<-` prohibited).
@@ -106,60 +106,8 @@ Default to this capability for read-only inspection. `<<preview>>` is conservati
 Example:
 
 ```         
-obj <- cca
+obj <- project_obj$sample_01
 <<preview>>Assays(obj)
-<<run>>
-```
-
-### RESULT (`<<result>>EXPR`)
-
-Use for one final read-only expression when precision matters and preview is insufficient. Each run includes at most one `<<run>>`.
-
-Critical warning: `<<result>>` currently serializes payloads with `dput(...)`. For large or complex objects (especially formal/S4 objects like Seurat internals), this can behave like full structural serialization and may block the live console unexpectedly.
-
--   `<<result>>` is strict: exactly one physical line with one complete expression; no assignments (`<-` prohibited).
--   Do not place multi-line blocks (`{...}`), loops, or function definitions in `<<result>>`. Stage those with APPEND first.
--   Do not split a `<<result>>...` expression across multiple input lines. Any later lines are treated as APPEND and will break intent.
--   If `<<result>>` ends with an operator/comma/open delimiter (for example `<<result>>list(`), the bridge rejects it as incomplete before `<<run>>`.
--   Multi-step prep goes in APPEND.
--   Skip if `benchmark` option is on; result is automatically set to elapsed time.
--   Before requesting `<<result>>`, explicitly probe:
-    `class(x)`, `isS4(x)`, `dim(x)`/`length(x)`, and `object.size(x)`.
--   If object is formal/S4, high-dimensional, or large, do not `<<result>>` the raw object.
-    Manually construct a safe representation first (for example `str(x, max.level = 1)`, `head(...)`, selected vectors/tables).
-
-Example:
-
-```         
-res <- class(project_obj$sample_01)
-<<result>>res
-<<run>>
-```
-
-Anti-pattern (invalid):
-
-```         
-<<result>>list(
-a = sapply(
-    vec,
-    \(i) i + 1
-  )
-)
-<<run>>
-```
-
-Anti-pattern (valid, but strongly discouraged):
-
-```         
-<<result>>list(a = sapply(vec, my_func))
-```
-
-Preferred pattern:
-
-```         
-tmp <- vec
-tmp2 <- sapply(tmp, my_func)
-<<result>>tmp2
 <<run>>
 ```
 
@@ -186,6 +134,53 @@ Special example: when plots must be visible to the user, make sure to use `print
 obj <- project_obj$sample_01
 print(Seurat::DimPlot(obj))
 <<run>>
+```
+
+### RESULT (`<<result>>EXPR`)
+
+Use for one final read-only expression when precision matters and preview is insufficient. Each run includes at most one `<<run>>`.
+
+Critical warning: `<<result>>` currently serializes payloads with `dput(...)`. For large or complex objects (especially formal/S4 objects like Seurat internals), this can behave like full structural serialization and may block the live console unexpectedly.
+
+-   `<<result>>` is strict: exactly one physical line with one complete expression; no assignments (`<-` prohibited).
+-   Do not place multi-line blocks (`{...}`), loops, or function definitions in `<<result>>`. Stage those with APPEND first.
+-   Do not split a `<<result>>...` expression across multiple input lines. Any later lines are treated as APPEND and will break intent.
+-   If `<<result>>` ends with an operator/comma/open delimiter (for example `<<result>>list(`), the bridge rejects it as incomplete before `<<run>>`.
+-   Explicitly probe ahead: `class(x)`, `isS4(x)`, `dim(x)`/`length(x)`, and `object.size(x)`.
+-   If object is formal/S4, high-dimensional, or large, do not `<<result>>` the raw object. Manually construct a safe representation first (for example `str(x, max.level = 1)`, `head(...)`, selected vectors/tables).
+
+Example:
+
+```         
+res <- class(project_obj$sample_01)
+<<result>>res
+<<run>>
+```
+
+Anti-pattern (invalid):
+
+```         
+<<result>>list(
+  a = sapply(
+    vec,
+    my_func
+  )
+)
+<<run>>
+```
+
+Anti-pattern (valid, but strongly discouraged):
+
+```         
+<<result>>list(a = sapply(vec, my_func))
+```
+
+Preferred pattern:
+
+```         
+tmp <- vec
+tmp2 <- sapply(tmp, my_func)
+<<result>>tmp2 <<run>>
 ```
 
 ### EXPORT (`<<export>>EXPR`)
@@ -277,6 +272,10 @@ Cleanup:
 unlink("/absolute/path/from/state-export")
 ```
 
+## Step 7. Present output
+
+Humans comprehend visual patterns much more easily than text or numbers. You are strongly encouraged to think of ways to visually emphasize your most significant findings. APPEND plot calls wrapped with `print(...)` to draw plots directly into the live Rstudio graphics device.
+
 ## Guardrails
 
 ### Hard code requirements
@@ -294,14 +293,12 @@ Run these checks for every line of code you write.
 -   Avoid complex one-liner construction like giant `list(...)` or heavy inline indexing in one command.
 -   Avoid semicolon-separated multi-statement lines and deeply nested expressions.
 -   Strongly prefer explicit intermediate variables and short commands that are easy to debug.
--   Prefer `<<preview>>` as the first probe. Escalate to `<<result>>` only when exact values are required.
--   Before any `<<result>>`, run explicit probes for class/category (`class`, `isS4`), shape (`dim` or `length`), and size (`object.size`).
 -   Keep one action per line in both append and background R commands.
--   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
--   If `<<run>>` unexpectedly fails, run `<<smoke>>`, then use `<<show>>` to verify staged capabilities before retrying.
 
-### Important reminder
+### Important reminders
 
+-   R can be unexpectedly slow. Be pessimistic and prefer `<<preview>>` as the first probe. Escalate to `<<result>>` only when exact values are required.
+-   Before any `<<result>>`, run explicit probes for class/category (`class`, `isS4`), shape (`dim` or `length`), and size (`object.size`).
 -   Whole-object exports are rarely needed. Prefer exporting a minimal payload with only the fields needed for follow-up (embedding coordinates, metadata, etc). Avoid exporting whole objects unless the user explicitly asks.
 -   R functions are slow. Estimate ETA conservatively. Discuss with the user before beginning expensive computations in the live console.
 

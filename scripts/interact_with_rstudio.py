@@ -30,6 +30,19 @@ APPEND_FILE_BLOCKED_PATTERNS = [
     r"(^|[^A-Za-z0-9_.])(write|writeLines|write\.csv|write\.csv2|write\.delim|write\.delim2|write\.table|fwrite|cat|saveRDS|save|load|file\.create|dir\.create|unlink|file\.remove|file\.rename|file\.copy|file\.append|download\.file|png|jpeg|svg|bmp|tiff|pdf|postscript|quartz|x11)\s*\(",
 ]
 
+READONLY_EXPR_BLOCKED_PATTERNS = [
+    r"(^|[^A-Za-z0-9_.])(assign|delayedAssign|assignInNamespace|assignInMyNamespace|makeActiveBinding|lockBinding|unlockBinding)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(rm|remove)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(source)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(write|writeLines|write\.csv|write\.csv2|write\.delim|write\.delim2|write\.table|fwrite|cat|saveRDS|save|load|serialize|dput|dump|put)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(file\.create|dir\.create|unlink|file\.remove|file\.rename|file\.copy|file\.append|download\.file)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(sink|png|jpeg|svg|bmp|tiff|pdf|postscript|quartz|x11|dev\.off|dev\.set|dev\.new)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(setwd|options|Sys\.setenv|Sys\.unsetenv|library|require|attach|detach|system|system2|shell)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(q|quit)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(trace|untrace|setClass|setMethod|setGeneric|setRefClass|registerS3method)\s*\(",
+    r"(^|[^A-Za-z0-9_.])(\.GlobalEnv|globalenv\s*\()",
+]
+
 LIKELY_INCOMPLETE_SUFFIX_PATTERN = re.compile(
     r"("
     r","
@@ -162,6 +175,12 @@ def validate_append_file_restrictions(code: str) -> None:
     for regex in APPEND_FILE_BLOCKED_PATTERNS:
         if contains_regex(code, regex):
             raise ValidationError("APPEND_CODE may not write files.")
+
+
+def validate_readonly_expr_restrictions(code: str, label: str) -> None:
+    for regex in READONLY_EXPR_BLOCKED_PATTERNS:
+        if contains_regex(code, regex):
+            raise ValidationError(f"{label} must be read-only; blocked pattern ({regex}).")
 
 
 def has_unbalanced_delimiters_or_quotes(value: str) -> bool:
@@ -312,15 +331,17 @@ def validate_append_snippet(snippet: str) -> None:
 
 def validate_result_expr(expr: str) -> str:
     normalized = validate_single_line_expression_contract(expr, "result")
-    validate_common_blocklist(expr, "Result expression")
-    validate_assignment_free(expr, "Result expression")
+    validate_common_blocklist(normalized, "Result expression")
+    validate_assignment_free(normalized, "Result expression")
+    validate_readonly_expr_restrictions(normalized, "Result expression")
     return normalized
 
 
 def validate_preview_expr(expr: str) -> str:
     normalized = validate_single_line_expression_contract(expr, "preview")
-    validate_common_blocklist(expr, "Preview expression")
-    validate_assignment_free(expr, "Preview expression")
+    validate_common_blocklist(normalized, "Preview expression")
+    validate_assignment_free(normalized, "Preview expression")
+    validate_readonly_expr_restrictions(normalized, "Preview expression")
     return normalized
 
 
@@ -760,7 +781,6 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
     r_exec_lines: List[str] = []
     r_create_lines: List[str] = []
     r_modify_lines: List[str] = []
-    r_create_names: List[str] = []
 
     for snippet in state.append_code_snippets:
         r_exec_lines.append(snippet)
@@ -867,7 +887,6 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
         if name in seen:
             raise ValidationError(f"create duplicates name '{name}' in one invocation.")
         seen.add(name)
-        r_create_names.append(name)
         r_create_lines.append(
             f'if (exists("{name}", envir = .GlobalEnv, inherits = FALSE)) stop("CREATE_NEW_GLOBAL_VARIABLE refused: \'{name}\' already exists in .GlobalEnv")'
         )
@@ -878,7 +897,6 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
         escaped = escape_for_r_string(snippet)
         r_modify_lines.append(f'eval(parse(text = "{escaped}"), envir = .GlobalEnv)')
 
-    r_allowed_added = ",".join(f'"{name}"' for name in r_create_names)
     r_exec_block = join_lines(r_exec_lines)
     r_create_block = join_lines(r_create_lines)
     r_modify_block = join_lines(r_modify_lines)
@@ -888,8 +906,6 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
         out_path_escaped = escape_for_r_string(run_ctx.out_path)
 
     r_code = ""
-    r_code += '.codex_before <- ls(envir = .GlobalEnv, all.names = TRUE)\n'
-    r_code += f'.codex_allowed_added <- c({r_allowed_added})\n'
     r_code += f'.codex_append_only <- {"TRUE" if run_ctx.append_only else "FALSE"}\n'
     r_code += f'.codex_result_out_path <- "{out_path_escaped}"\n'
     r_code += '.codex_captured_stdout <- character(0)\n'
@@ -949,14 +965,6 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
 
     r_code += 'if (!is.null(.codex_exec_error)) {\n'
     r_code += '  stop(.codex_msg(.codex_exec_error))\n'
-    r_code += '}\n'
-    r_code += '.codex_after <- ls(envir = .GlobalEnv, all.names = TRUE)\n'
-    r_code += '.codex_new <- setdiff(.codex_after, .codex_before)\n'
-    r_code += '.codex_removed <- setdiff(.codex_before, .codex_after)\n'
-    r_code += '.codex_unexpected_new <- setdiff(.codex_new, .codex_allowed_added)\n'
-    r_code += '.codex_unexpected_removed <- setdiff(.codex_removed, character(0))\n'
-    r_code += 'if (length(.codex_unexpected_new) > 0 || length(.codex_unexpected_removed) > 0) {\n'
-    r_code += '  stop("Global environment leak detected")\n'
     r_code += '}\n'
     return r_code
 

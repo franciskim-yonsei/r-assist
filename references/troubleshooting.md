@@ -1,6 +1,11 @@
 # Troubleshooting
 
-Use this reference when `interact_with_rstudio.sh` or its RPC helper fails.
+Use this reference when `interact_with_rstudio.py` fails.
+
+## First-aid for general errors
+
+-   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
+-   If `<<run>>` unexpectedly fails, run `<<smoke>>`, then use `<<show>>` to verify staged capabilities before retrying.
 
 ## Timeout Triage
 
