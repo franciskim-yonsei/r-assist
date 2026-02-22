@@ -395,6 +395,42 @@ load_session_environment() {
   fi
 }
 
+get_session_property_file() {
+  local key="$1"
+  local path_typo="$SESSION_DIR/properites/$key"
+  local path_fixed="$SESSION_DIR/properties/$key"
+
+  if [[ -f "$path_typo" ]]; then
+    printf "%s" "$path_typo"
+    return 0
+  fi
+
+  if [[ -f "$path_fixed" ]]; then
+    printf "%s" "$path_fixed"
+    return 0
+  fi
+
+  return 1
+}
+
+check_session_busy_before_rpc() {
+  local executing_file=""
+  local executing_value=""
+
+  executing_file="$(get_session_property_file executing || true)"
+
+  if [[ -n "$executing_file" ]]; then
+    executing_value="$(tr -d "[:space:]" < "$executing_file" 2>/dev/null || true)"
+  fi
+
+  if [[ "$executing_value" == "1" ]]; then
+    echo "RStudio session appears busy (executing=1)." >&2
+    echo "Finish or interrupt the current console task, then retry." >&2
+    return 1
+  fi
+
+  return 0
+}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --append-code)
@@ -698,6 +734,10 @@ rpc_send() {
     "${cmd[@]}"
   fi
 }
+
+if ! check_session_busy_before_rpc; then
+  exit 1
+fi
 
 if [[ "$EXPECT_RESULT" == "1" ]]; then
   if ! rpc_send 1; then
