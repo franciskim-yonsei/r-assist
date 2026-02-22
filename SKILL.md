@@ -7,7 +7,7 @@ description: Trigger for prompts where correctness depends on user's live RStudi
 
 ## Overview
 
-Interrogate live RStudio session via `bash SKILL_DIR/scripts/interact_with_rstudio.sh` (Convention in this document: `SKILL_DIR` refers to the directory containing this `SKILL.md` file).
+Interrogate live RStudio session via `python3 SKILL_DIR/scripts/interact_with_rstudio.py` (Convention in this document: `SKILL_DIR` refers to the directory containing this `SKILL.md` file).
 
 ## Workflow
 
@@ -15,8 +15,9 @@ Interrogate live RStudio session via `bash SKILL_DIR/scripts/interact_with_rstud
 2.  Use `python3 SKILL_DIR/scripts/interact_with_rstudio.py` to start an interactive command-building shell.
 3.  Use your defined capabilities to build the R code.
 4.  Apply appropriate options, then send the code.
-5.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
-6.  Inspect output and iterate. If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
+5.  Inspect output and iterate.
+6.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
+7.  If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
 
 ## Step 1. Decide mode of operation
 
@@ -75,6 +76,7 @@ Use `references/long-computation.md` as the operational playbook for Mode C. It 
 -   For every escalated script call, always provide `prefix_rule=["python3","SKILL_DIR/scripts/interact_with_rstudio.py"]`; never include runtime flags/code in the prefix rule.
 -   For interactive bridge sessions in Codex, use `tty=true` so one persistent session id can be reused with `write_stdin` polling.
 -   Do not use `printf` with pipes or heredoc mode.
+-   Before complex payloads, run `smoke` once to confirm bridge responsiveness and output transport.
 
 ## Step 3. Write code
 
@@ -95,6 +97,7 @@ Once you are in the interactive command-building shell, you can exert the follow
 Use for one final read-only expression.
 
 -   Only one single-line expression, no assignments (`<-` prohibited!).
+-   Do not place multi-line blocks (`{...}`), loops, or function definitions in `result:`. Stage those in `append:` first.
 -   Multi-step prep goes in APPEND.
 -   Skip if `benchmark` option is on; result is automatically set to elapsed time.
 
@@ -165,7 +168,6 @@ Options are also set interactively using stdin. Use `<option-name>:<value>.`
 -   `benchmark:<on|off>`: Benchmark mode for `result:`; returns elapsed time (not the expression value).
 -   `benchmark-unit:<seconds|ms>`: Unit for benchmark output.
 -   `print-code:<on|off>`: Print generated R snippet to stderr before RPC send.
--   `capture-output:<on|off>`: Return structured stdout/stderr together with `result:`/`export:` payloads.
 
 Finally, `send` the finished R-code.
 
@@ -175,7 +177,17 @@ Finally, `send` the finished R-code.
 
 -   Treat tool `yield_time_ms` as output polling only, not cancellation. Keep a single live `interact_with_rstudio.py` exec session per run, poll that same session while `send` is in flight, and do not start another `send`/process until the prior one returns.
 
-## Step 5. Working with background sessions (mode B)
+## Step 5. Interpret output
+
+Bridge output interpretation:
+
+-   Success returns a structured payload with `result`, `stdout`, and `stderr`.
+-   `append:`-only sends are treated as success with implicit `result = NULL` plus captured `stdout`/`stderr`.
+-   Failure returns a structured payload with `error`, `stdout`, and `stderr`.
+-   `stdout` can be noisy and non-empty on successful runs (for example from `print(...)`).
+-   Treat parse failures (`__SYNTAX_ERROR__`), RPC failures, and explicit `error` payloads as actual failures.
+
+## Step 6. Working with background sessions (mode B)
 
 Example:
 
@@ -217,6 +229,7 @@ Run these checks for every line of code you write.
 -   Strongly prefer explicit intermediate variables and short commands that are easy to debug.
 -   Keep one action per line in both `append:` and background R commands.
 -   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
+-   If a `send` unexpectedly fails, run `smoke`, then use `show` to verify staged capabilities before retrying.
 
 ### Important reminder
 

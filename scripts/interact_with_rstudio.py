@@ -48,7 +48,6 @@ class State:
     benchmark_mode: bool = False
     benchmark_unit: str = "seconds"
     print_code: bool = False
-    capture_output: bool = False
 
     def clear_capabilities(self) -> None:
         self.append_code_snippets = []
@@ -488,11 +487,8 @@ def validate_state_for_send(state: State) -> SendContext:
     for snippet in state.modify_global_snippets:
         validate_modify_global_snippet(snippet)
 
-    expect_result = bool(state.result_expr or state.state_export_expr)
     append_only = has_append and not has_terminal
-
-    if state.capture_output and not expect_result:
-        raise ValidationError("capture-output requires result or export.")
+    expect_result = bool(state.result_expr or state.state_export_expr or append_only)
 
     out_path = state.out_path
     is_temp_out_path = False
@@ -632,8 +628,8 @@ def build_r_code(state: State, send_ctx: SendContext) -> str:
     r_code = ""
     r_code += '.codex_before <- ls(envir = .GlobalEnv, all.names = TRUE)\n'
     r_code += f'.codex_allowed_added <- c({r_allowed_added})\n'
+    r_code += f'.codex_append_only <- {"TRUE" if send_ctx.append_only else "FALSE"}\n'
     r_code += f'.codex_result_out_path <- "{out_path_escaped}"\n'
-    r_code += f'.codex_capture_output <- {"TRUE" if state.capture_output else "FALSE"}\n'
     r_code += '.codex_captured_stdout <- character(0)\n'
     r_code += '.codex_captured_stderr <- character(0)\n'
     r_code += '.codex_result_written <- FALSE\n'
@@ -650,55 +646,42 @@ def build_r_code(state: State, send_ctx: SendContext) -> str:
     r_code += '.codex_msg <- function(x) {\n'
     r_code += '  if (inherits(x, "condition")) conditionMessage(x) else as.character(x)\n'
     r_code += '}\n'
-    r_code += '.codex_exec_error <- tryCatch({\n'
-    r_code += '  if (.codex_capture_output) {\n'
-    r_code += '    .codex_captured_stdout <- capture.output({\n'
-    r_code += '      withCallingHandlers({\n'
-    r_code += '        .codex_run_core()\n'
-    r_code += '      }, message = function(m) {\n'
-    r_code += '        .codex_captured_stderr <<- c(.codex_captured_stderr, conditionMessage(m))\n'
-    r_code += '        invokeRestart("muffleMessage")\n'
-    r_code += '      }, warning = function(w) {\n'
-    r_code += '        .codex_captured_stderr <<- c(.codex_captured_stderr, paste0("WARNING: ", conditionMessage(w)))\n'
-    r_code += '        invokeRestart("muffleWarning")\n'
-    r_code += '      })\n'
-    r_code += '    }, type = "output")\n'
-    r_code += '  } else {\n'
-    r_code += '    .codex_run_core()\n'
-    r_code += '  }\n'
-    r_code += '}, error = function(e) e)\n'
+    r_code += '.codex_exec_error <- NULL\n'
+    r_code += 'tryCatch({\n'
+    r_code += '  .codex_captured_stdout <- capture.output({\n'
+    r_code += '    withCallingHandlers({\n'
+    r_code += '      .codex_run_core()\n'
+    r_code += '    }, message = function(m) {\n'
+    r_code += '      .codex_captured_stderr <<- c(.codex_captured_stderr, conditionMessage(m))\n'
+    r_code += '      invokeRestart("muffleMessage")\n'
+    r_code += '    }, warning = function(w) {\n'
+    r_code += '      .codex_captured_stderr <<- c(.codex_captured_stderr, paste0("WARNING: ", conditionMessage(w)))\n'
+    r_code += '      invokeRestart("muffleWarning")\n'
+    r_code += '    })\n'
+    r_code += '  }, type = "output")\n'
+    r_code += '}, error = function(e) {\n'
+    r_code += '  .codex_exec_error <<- e\n'
+    r_code += '})\n'
 
     if send_ctx.expect_result:
         r_code += 'if (!is.null(.codex_exec_error)) {\n'
-        r_code += '  if (.codex_capture_output) {\n'
-        r_code += '    dput(list(error = .codex_msg(.codex_exec_error), stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
-        r_code += '  } else {\n'
-        r_code += '    writeLines(paste0("__ERROR__:", .codex_msg(.codex_exec_error)), .codex_result_out_path)\n'
-        r_code += '  }\n'
+        r_code += '  dput(list(error = .codex_msg(.codex_exec_error), stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
         r_code += '  .codex_result_written <- TRUE\n'
         r_code += '}\n'
         r_code += 'if (is.null(.codex_exec_error) && is.null(.codex_exec_result)) {\n'
-        r_code += '  if (.codex_capture_output) {\n'
-        r_code += '    dput(list(error = "no result produced", stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
+        r_code += '  if (.codex_append_only) {\n'
+        r_code += '    dput(list(result = NULL, stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
         r_code += '  } else {\n'
-        r_code += '    writeLines("__ERROR__: no result produced", .codex_result_out_path)\n'
+        r_code += '    dput(list(error = "no result produced", stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
         r_code += '  }\n'
         r_code += '  .codex_result_written <- TRUE\n'
         r_code += '}\n'
         r_code += 'if (is.null(.codex_exec_error) && inherits(.codex_exec_result, "error")) {\n'
-        r_code += '  if (.codex_capture_output) {\n'
-        r_code += '    dput(list(error = .codex_msg(.codex_exec_result), stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
-        r_code += '  } else {\n'
-        r_code += '    writeLines(paste0("__ERROR__:", .codex_msg(.codex_exec_result)), .codex_result_out_path)\n'
-        r_code += '  }\n'
+        r_code += '  dput(list(error = .codex_msg(.codex_exec_result), stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
         r_code += '  .codex_result_written <- TRUE\n'
         r_code += '}\n'
         r_code += 'if (is.null(.codex_exec_error) && !inherits(.codex_exec_result, "error") && !is.null(.codex_exec_result)) {\n'
-        r_code += '  if (.codex_capture_output) {\n'
-        r_code += '    dput(list(result = .codex_exec_result, stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
-        r_code += '  } else {\n'
-        r_code += '    dput(.codex_exec_result, file = .codex_result_out_path)\n'
-        r_code += '  }\n'
+        r_code += '  dput(list(result = .codex_exec_result, stdout = .codex_captured_stdout, stderr = .codex_captured_stderr), file = .codex_result_out_path)\n'
         r_code += '  .codex_result_written <- TRUE\n'
         r_code += '}\n'
 
@@ -769,8 +752,8 @@ def send_current_state(state: State, script_dir: Path) -> None:
 
         if send_ctx.append_only:
             print(
-                "Warning: APPEND-only send has no structured return value. "
-                "Add result:/export:/create:/modify: if you need output.",
+                "Warning: APPEND-only send returns implicit result=NULL with captured stdout/stderr. "
+                "Add result:/export:/create:/modify: if you need explicit payloads.",
                 file=sys.stderr,
             )
 
@@ -857,9 +840,9 @@ def print_help() -> None:
         "  benchmark:<on|off>            Benchmark result expression\n"
         "  benchmark-unit:<seconds|ms>   Unit for benchmark\n"
         "  print-code:<on|off>           Print generated R snippet to stderr\n"
-        "  capture-output:<on|off>       Return structured stdout/stderr with result\n"
         "\n"
         "Control:\n"
+        "  smoke                          Run a minimal bridge health check send\n"
         "  show                           Show current accumulated state\n"
         "  clear                          Clear accumulated capabilities\n"
         "  send                           Validate/build/send accumulated request\n"
@@ -885,7 +868,6 @@ def show_state(state: State) -> None:
     print(f"  benchmark: {'on' if state.benchmark_mode else 'off'}")
     print(f"  benchmark-unit: {state.benchmark_unit}")
     print(f"  print-code: {'on' if state.print_code else 'off'}")
-    print(f"  capture-output: {'on' if state.capture_output else 'off'}")
 
 
 def apply_input_line(state: State, line: str) -> Optional[str]:
@@ -905,6 +887,12 @@ def apply_input_line(state: State, line: str) -> Optional[str]:
         state.clear_capabilities()
         print("Cleared accumulated capabilities.")
         return None
+
+    if normalized == "smoke":
+        if pending_capability_count(state) > 0:
+            raise ValidationError("smoke requires no pending capabilities. Use clear first.")
+        state.result_expr = 'paste("bridge_ok", format(Sys.time(), "%Y-%m-%d %H:%M:%S"))'
+        return "send"
 
     if normalized == "send":
         return "send"
@@ -957,8 +945,6 @@ def apply_input_line(state: State, line: str) -> Optional[str]:
         state.benchmark_unit = value
     elif key == "print-code":
         state.print_code = parse_bool(payload)
-    elif key == "capture-output":
-        state.capture_output = parse_bool(payload)
     else:
         raise ValidationError(f"Unknown input prefix: {prefix}")
 
