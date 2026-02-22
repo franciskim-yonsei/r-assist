@@ -431,6 +431,108 @@ check_session_busy_before_rpc() {
 
   return 0
 }
+
+get_executing_flag_value() {
+  local executing_file=""
+  local executing_value=""
+
+  executing_file="$(get_session_property_file executing || true)"
+  if [[ -n "$executing_file" ]]; then
+    executing_value="$(tr -d "[:space:]" < "$executing_file" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$executing_value" ]]; then
+    echo "<missing>"
+  else
+    echo "$executing_value"
+  fi
+}
+
+result_file_size_bytes() {
+  local path="$1"
+  if [[ ! -e "$path" ]]; then
+    echo "0"
+    return 0
+  fi
+  wc -c < "$path" 2>/dev/null | tr -d '[:space:]'
+}
+
+diagnose_result_wait_timeout() {
+  local out_path="$1"
+  local executing_value=""
+  local out_exists="0"
+  local out_size="0"
+  local pid_value="${RSTUDIO_SESSION_PID-}"
+  local pid_state="<missing>"
+  local state_file="$SESSION_DIR/session-persistent-state"
+  local abend_value=""
+  local -a causes=()
+  local causes_csv=""
+
+  executing_value="$(get_executing_flag_value)"
+
+  if [[ -e "$out_path" ]]; then
+    out_exists="1"
+  fi
+  out_size="$(result_file_size_bytes "$out_path")"
+  if [[ -z "$out_size" || ! "$out_size" =~ ^[0-9]+$ ]]; then
+    out_size="0"
+  fi
+
+  if [[ -n "$pid_value" ]]; then
+    if session_pid_is_alive "$pid_value"; then
+      pid_state="alive"
+    elif [[ "$pid_value" =~ ^[0-9]+$ ]]; then
+      pid_state="dead_or_not_rsession"
+    else
+      pid_state="invalid"
+    fi
+  fi
+
+  if [[ -f "$state_file" ]]; then
+    abend_value="$(extract_state_value "$state_file" "abend")"
+  fi
+  if [[ -z "$abend_value" ]]; then
+    abend_value="<missing>"
+  fi
+
+  if [[ "$executing_value" == "1" ]]; then
+    causes+=("compute_still_running")
+  fi
+  if [[ "$out_exists" == "1" && "$out_size" == "0" && "$executing_value" != "1" ]]; then
+    causes+=("handoff_or_write_delay")
+  fi
+  if [[ "$out_exists" == "0" ]]; then
+    causes+=("output_path_unavailable")
+  fi
+  if [[ "$pid_state" == "dead_or_not_rsession" || "$pid_state" == "invalid" || "$abend_value" == "1" ]]; then
+    causes+=("session_liveness_issue")
+  fi
+  if (( ${#causes[@]} == 0 )); then
+    causes+=("unknown")
+  fi
+
+  causes_csv="$(IFS=,; echo "${causes[*]}")"
+  echo "Timeout diagnostics: causes=${causes_csv}" >&2
+  echo "Timeout diagnostics: executing=${executing_value} output_exists=${out_exists} output_size_bytes=${out_size} session_pid=${pid_value:-<missing>}(${pid_state}) abend=${abend_value}" >&2
+
+  if [[ "$executing_value" == "1" ]]; then
+    echo "Likely cause: R code is still running in the live console." >&2
+    echo "Action: interrupt or wait for the current console task before retrying." >&2
+  fi
+  if [[ "$out_exists" == "1" && "$out_size" == "0" && "$executing_value" != "1" ]]; then
+    echo "Possible cause: compute finished but result handoff/file write lagged." >&2
+    echo "Action: increase --timeout, reduce payload size, and retry once." >&2
+  fi
+  if [[ "$out_exists" == "0" ]]; then
+    echo "Possible cause: output file was removed or inaccessible while waiting." >&2
+    echo "Action: verify /tmp availability and file permissions, then retry." >&2
+  fi
+  if [[ "$pid_state" == "dead_or_not_rsession" || "$pid_state" == "invalid" || "$abend_value" == "1" ]]; then
+    echo "Possible cause: session snapshot points to a dead/restarted rsession." >&2
+    echo "Action: re-resolve live runtime env vars and retry once." >&2
+  fi
+}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --append-code)
@@ -763,6 +865,7 @@ if [[ "$EXPECT_RESULT" == "1" ]]; then
 
   if [[ ! -s "$OUT_PATH" ]]; then
     echo "Timed out waiting for result file: $OUT_PATH" >&2
+    diagnose_result_wait_timeout "$OUT_PATH"
     exit 1
   fi
 fi
