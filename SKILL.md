@@ -1,90 +1,73 @@
 ---
 name: r-assist
-description: Trigger for R prompts where correctness depends on inspecting the user's live RStudio session state. Use when a prompt references concrete in-session objects/expressions and asks what currently exists (values, levels, labels, fields, dimensions), what a concrete expression currently returns, or why a concrete runtime call fails (including plotting/debugging issues such as Seurat::DimPlot behavior). Treat R-domain cues (syntax, operators, package/function names) as supporting evidence, not sufficient alone. Prefer false positives over false negatives when uncertain. Skip only conceptual/stateless R questions or meta discussion about this skill.
+description: Trigger for prompts where correctness depends on user's live RStudio session state. Rather than asking the user for more context, interrogate the session yourself. Use when a prompt references concrete in-session objects/expressions and asks for current values, levels, labels, dimensions, or concrete failures.
 ---
 
-# Talk to Rstudio
+# Assist with R analysis
 
 ## Overview
 
-Utilize a defined set of capabilities to build a call to `interact_with_rstudio.sh` and communicate with the live Rstudio session.
-
-## Trigger Policy
-
-Use this skill when correctness depends on live RStudio session state.
-
--   Trigger when prompts reference concrete in-session objects/expressions and ask for current values, levels, fields, dimensions, labels, runtime behavior, or concrete failures.
--   Trigger when state-dependent intent is clear and R-domain evidence exists (syntax/operators/package names/RStudio context).
--   Treat R-domain cues as supporting evidence, not sufficient evidence by themselves.
--   Prefer false positives over false negatives when uncertain.
--   Skip only conceptual/stateless R questions and meta discussion about this skill.
-
-Strong state-dependent signals:
-
--   Runtime symptom phrasing tied to concrete objects/expressions: `returns NULL`, `error`, `unexpected output`, `why this result`, `won't work`.
--   Plot/debug prompts where behavior depends on live object internals (for example Seurat `DimPlot` behavior).
+-   Primary source of truth is the live RStudio session via `scripts/interact_with_rstudio.sh` (expanded to absolute path).
+-   Use your capabilities build a call to the wrapper script that will interrogate the live Rstudio session.
+-   Export live session state and continue in a background R session for iterative exploration or experimentation.
 
 ## Workflow
 
-Follow this sequence for every task:
-
-1.  Translate user intent into the smallest R code you need to communicate to the Rstudio session.
-2.  Determine capabilities to exert in order to chain the code together.
-3.  Apply approval gate immediately before any global-side-effect capability.
-4.  Run code-generation checks before sending RPC.
-5.  Send one finalized snippet through `interact_with_rstudio.sh`.
-6.  Inspect output and iterate only if needed.
+1.  Identify the minimum objects/functions needed from live RStudio.
+2.  Classify the task:
+    -   One-shot read/check: send code directly to the live console to avoid expensive exports.
+    -   Experimentation/comparison/tuning: use `R_STATE_EXPORT` once, then continue in background R, to minimize console pollution and accidental user-facing side effects.
+3.  Choose payload shape to minimize serialization cost (fewest objects possible).
+4.  Perform iterative work in background R.
+5.  If the user expects live output, send back only final user-facing artifact(s) to live RStudio (for plots: one final `print(...)` by default).
 
 ## Capabilities
 
 ### Quick reference
 
-Your capabilities each pertain to different scopes. Objects created/living in different scopes have different lifetimes:
-
--   The Temporary scratch env exists only for the current wrapper call. Objects created within this scope will not persist the next time you invoke the wrapper call.
--   The Cache environment (`codex_cache` env in `.GlobalEnv`) persists across wrapper calls until `CLEAR_CACHE` or R session restart. Use this environment to store computationally expensive intermediates during complex reasoning involving multiple rounds of back-and-forth.
--   The Global environment (`.GlobalEnv`) is read-only unless given explicit instruction. It is extremely dangerous to create anything within this scope, more so to modify existing elements.
-
 | Capability | Purpose | Scope | Approval |
 |------------------|------------------|------------------|------------------|
-| `SET_RESULT_EXPR` (`--set-result-expr`) | Return one expression value through file transport | Temporary execution scope with read access to Cache/Global environments | Not required |
-| `APPEND_CODE` (`--append-code`) | Stage helper statements for one invocation | Temporary scratch environment | Not required |
-| `CACHE_CODE` (`--cache-code`) | Create/update/delete reusable working state entries | Cache environment | Not required |
-| `CLEAR_CACHE` (`--clear-cache`) | Clear cache contents and remove cache container | Cache environment | Not required |
-| `CREATE_NEW_GLOBAL_VARIABLE` (`--create-global-variable`) | Create new persistent `.GlobalEnv` binding | Global environment | Required (explicit) |
-| `MODIFY_GLOBAL_ENV` (`--modify-global-env`) | Mutate existing persistent session state | Global environment | Required per statement (explicit, stricter) |
+| `SET_RESULT_EXPR` (`--set-result-expr`) | Return one expression value via file transport | Temporary execution scope with global read access | Not required |
+| `APPEND_CODE` (`--append-code`) | Stage helper statements for one invocation | Temporary scratch env | Not required |
+| `R_STATE_EXPORT` (`--r-state-export`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Not required |
+| `CREATE_NEW_GLOBAL_VARIABLE` (`--create-global-variable`) | Create new persistent `.GlobalEnv` binding | Global | Required |
+| `MODIFY_GLOBAL_ENV` (`--modify-global-env`) | Mutate existing persistent state | Global | Required |
+
+### Console-vs-background tradeoff
+
+-   `APPEND_CODE` is low-cost and fast for simple checks, but it only creates temporary objects that expire after each wrapper call, which touches the live console every time.
+-   `R_STATE_EXPORT` avoids repeated console calls, but costs serialization time and disk I/O.
+-   Use `R_STATE_EXPORT` when:
+    -   multiple follow-ups are likely on the same in-session objects,
+    -   intermediate state will be reused,
+    -   many intermediates are required that need not be visible to the user,
+    -   repeated `APPEND_CODE` attempts would be expensive, or
+    -   the task evaluates many alternatives (palettes, parameter grids, model variants, plot styles).
+-   Use `APPEND_CODE` when follow-up is trivial or objects are very large and repeated exploration is unlikely.
+-   RULE OF THUMB: pick your concern - choose `APPEND_CODE` to avoid expensive export; choose `R_STATE_EXPORT` to avoid console/plot clutter.
 
 ### `SET_RESULT_EXPR` (`--set-result-expr`)
 
-Use for one final expression whose value must be returned.
+Use for one final read-only expression.
 
--   Emit value by `dput` to an internal temp file.
--   Return `__ERROR__:<message>` on evaluation error.
--   Do not rely on `console_input` payload for expression values.
--   Accept only one single-line expression (no newline, no statement chaining).
--   Keep expression assignment-free (`<-`, `->` blocked).
--   Put all multi-line setup, helper assignments, and preprocessing in `--append-code`.
--   Treat `--set-result-expr` as read-only final retrieval from objects prepared earlier in the same invocation.
+-   Only one single-line expression, no assignments.
+-   Multi-step prep goes in `APPEND_CODE`.
 
-Read-only example:
+Example:
 
 ``` bash
 bash scripts/interact_with_rstudio.sh \
   --set-result-expr 'class(project_obj$sample_01)'
 ```
 
-This capability itself does not allow multi-step evaluation involving assignment. Consult the next section for such workflows.
-
 ### `APPEND_CODE` (`--append-code`)
 
-Use for temporary helper creation and staged probing inside one invocation. Objects created with `APPEND_CODE` are not available in later calls; expecting them later causes `object '<name>' not found`.
+Use for temporary setup and single-shot probing.
 
--   Allow assignment in temporary scope.
--   Reject direct `.GlobalEnv` / `globalenv()` targeting.
--   Reject direct `codex_cache` targeting; use `CACHE_CODE` instead.
--   Temporary scratch env is recreated every call and dropped automatically.
-
-Multi-step workflow example:
+-   Objects created here expire with the wrapper call.
+-   Avoid repeated console interactions for iterative debugging.
+-   Do not run exploratory loops that emit many plots in live RStudio by default.
+-   For plot-selection tasks, reserve live `print(...)` for the final selected plot unless user explicitly requests live comparisons.
 
 ``` bash
 bash scripts/interact_with_rstudio.sh \
@@ -93,148 +76,112 @@ bash scripts/interact_with_rstudio.sh \
   --set-result-expr 'head(plot_obj$data$colour)'
 ```
 
-### `CACHE_CODE` (`--cache-code`)
-
-Use for reusable cross-invocation working state. Consider exerting this capability if the setup is complex so you expect multiple rounds of communication with Rstudio, and re-computing intermediate variables is expected to be costly.
-
-Behavior:
-
--   Execute statements in `codex_cache` environment.
--   Auto-create `codex_cache` in `.GlobalEnv` when first needed.
--   Preserve cache across invocations until `CLEAR_CACHE` or R session restart.
--   Use for cache create/update/delete of entries only.
-
-Creation or modification of cached variables do not require explicit side-effect approval. Treat cache as your working state. But since it does create a persistent object visible to the user, you are advised to explain to the user what changed, why, and how to inspect/teardown it. You may want to suggest some follow-up actions:
-
--   List cached names: `ls(envir = codex_cache, all.names = TRUE)`
--   Read value: `codex_cache$<name>`
--   Delete one value: `rm(list = "<name>", envir = codex_cache)`
--   Full teardown: `rm(codex_cache)`
-
-But don't be too pedantic if the user seems knowledgeable and the focus of discussion lies elsewhere.
-
-Examples:
-
-Reusable expensive helper:
+Special example: when plots must be visible to the user, make sure to use `print(...)` around calls that return plot objects (ggplot2/patchwork/Seurat plot builders).
 
 ``` bash
 bash scripts/interact_with_rstudio.sh \
-  --cache-code 'counts <- GetAssayData(project_obj$sample_01, slot = "counts")'
+  --append-code 'obj <- otic[[4]]' \
+  --append-code 'print(Seurat::DimPlot(obj, reduction = "umap.rna"))'
 ```
 
-Modify cache mid-reasoning:
+### `R_STATE_EXPORT` (one-time extraction)
+
+Use when follow-up is likely.
+
+1.  Build the smallest possible payload expression from live objects in one call.
+2.  Double-check: whole-object exports are rarely needed. Prefer exporting a minimal payload (`list(...)`) with only the fields needed for follow-up. Avoid exporting whole Seurat/SingleCellExperiment objects unless the user explicitly asks.
+3.  Estimate export time before calling `--r-state-export`:
+    -   Probe payload size in live R (`object.size(...)`) with `APPEND_CODE` + `SET_RESULT_EXPR`.
+    -   Use a conservative estimate for `saveRDS(..., compress = "xz")`: `est_seconds = max(5, ceiling((bytes / (20 * 1024^2)) * 2))`.
+4.  If `est_seconds > 60`, ask the user for approval before export.
+5.  Set timeouts from the estimate before export:
+    -   `--rpc-timeout` at least `est_seconds + 30`.
+    -   `--timeout` at least `est_seconds + 60`.
+6.  Run `--r-state-export` once approved.
+7.  Script returns a path to the exported RDS.
+8.  Open background R and load with `readRDS()`.
+9.  Iterate there for follow-up calls.
+
+Live extraction pattern:
 
 ``` bash
 bash scripts/interact_with_rstudio.sh \
-  --cache-code 'rm(list = "counts")'
+  --append-code 'snap_obj <- project_obj$sample_01' \
+  --r-state-export 'list(sample_obj = snap_obj, created = Sys.time())'
 ```
 
-Discussion-end cleanup:
+Background session pattern:
 
--   At satisfactory endpoint, run `--clear-cache` by default unless retention is useful for likely follow-up.
--   If user opts out while still interactive, run `--clear-cache` and report cleanup.
--   If user quits abruptly, cache remains until manual removal or R restart.
-
-### `CLEAR_CACHE` (`--clear-cache`)
-
-Use for explicit cache teardown when working state is no longer needed.
-
--   Clear all objects in `codex_cache` (if present).
--   Remove `codex_cache` binding from `.GlobalEnv`.
--   No-op when `codex_cache` does not exist.
--   Do not require explicit side-effect approval (cache is agent working state).
-
-Example:
-
-``` bash
-bash scripts/interact_with_rstudio.sh \
-  --clear-cache
+``` r
+snapshot <- readRDS("/absolute/path/from/state-export")
+# continue interactively with `snapshot` in local R
 ```
+
+Cleanup:
+
+``` r
+unlink("/absolute/path/from/state-export")
+```
+
+Notes:
+
+-   This background process has no shared memory with RStudio; load libraries explicitly as needed because attached packages in RStudio are not inherited.
+-   Export only what is needed: smaller payloads are faster, cheaper, and less likely to block the live session.
+-   Default to exporting derived tables, vectors, embeddings, metadata slices, or marker results instead of entire assay objects.
+-   If package namespaces mismatch, stop and ask the user before continuing.
 
 ### `CREATE_NEW_GLOBAL_VARIABLE` (`--create-global-variable`)
 
-Use only for explicit user-requested persistent state creation.
-
--   Create new `.GlobalEnv` binding from `name=<expr>`.
--   Fail if `name` already exists in `.GlobalEnv`.
--   Reject reserved name `codex_cache`.
--   Require explicit approval immediately before invocation.
-
-Example:
-
-``` bash
-bash scripts/interact_with_rstudio.sh \
-  --create-global-variable 'debug_plot=Seurat::DimPlot(project_obj$sample_01)'
-```
+Use only for explicit user-requested persistent `.GlobalEnv` binding changes.
 
 ### `MODIFY_GLOBAL_ENV` (`--modify-global-env`)
 
-Use only for explicit user-requested mutation of existing session state.
+Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 
--   Evaluate explicit statement in `.GlobalEnv`.
--   Require explicit approval for each invocation.
--   Treat as higher risk than `CREATE_NEW_GLOBAL_VARIABLE`.
--   Restate exact statement and expected effect before running.
+## Guardrails
 
-Example:
+### How to call wrapper scripts
 
-``` bash
-bash scripts/interact_with_rstudio.sh \
-  --modify-global-env 'project_obj$sample_01 <- subset(project_obj$sample_01, idents = "A")'
-```
+-   Always call `bash scripts/interact_with_rstudio.sh` (expanded to absolute path); never call low-level socket helper scripts directly.
+-   In Codex tool calls, run wrapper invocations with escalation (`sandbox_permissions=require_escalated`) by default; sandbox execution is a known false-failure mode for `rpostback`/local socket access.
+-   For every escalated wrapper call, always provide `prefix_rule=["bash","scripts/interact_with_rstudio.sh"]` (expanded to absolute path); never include runtime flags/code in the prefix rule.
+-   Set both wait controls explicitly on long or uncertain calls: `--rpc-timeout` for the send step and `--timeout` for result-file wait.
+-   Treat tool `yield_time_ms` as output polling only, not process cancellation. Do not stack retries while a prior wrapper call is still running.
+-   Prefer live runtime env vars (`RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, `RSTUDIO_SESSION_PID`) when present. Do not blindly overwrite them with `suspended-session-data/environment_vars`, which may be stale.
 
-## Rules
+### Code-generation check
 
-### Which wrapper script to call
-
--   Always use `bash scripts/interact_with_rstudio.sh` as primary entrypoint wrapper.
--   Never use `communicate_with_rstudio_console_with_rpc_low_level.sh`, even as fallback or upon user request. It is only intended as a helper script for the primary wrapper. Guards are absent, hence invocation may cause unintended effects!
-
-### Permissions and escalation
-
--   Skip initial sandbox try for RPC: local socket access is known blocked in sandbox.
--   Run one escalated RPC call directly when execution is needed.
--   Keep wrapper invocation single-segment.
--   Include `prefix_rule` only when the wrapper prefix is not already approved.
--   When `prefix_rule` is needed, use wrapper-only prefixes: `["bash", "scripts/interact_with_rstudio.sh"]`
--   Never include dynamic flags/values (`--code`, `--expr`, object names, ids) in `prefix_rule`.
-
-### Timeout
-
--   Treat timeout as `unknown-state` by default. Do not assume "still running" or "definitely failed" unless later evidence confirms one state.
--   Choose `--timeout` based on expected workload complexity and data volume. Use higher budgets for broader scans/comparisons, lower budgets for lightweight probes.
--   Avoid rapid fire retries after unknown-state timeout; let the wrapper's recovery/probe flow finish before issuing another call.
-
-### Managing object lifecycles
-
--   Keep dependent temporary setup and final readout in the same invocation.
--   If follow-up calls need the same intermediate object, store it in `codex_cache` via `--cache-code`.
--   Default to `APPEND_CODE` for one-shot probes; promote to cache only when reuse is likely or setup is expensive.
--   Run `--clear-cache` when done unless user-visible reuse is still needed.
-
-### Code-Generation Checks
-
-Apply checks before every RPC call:
+Run these checks before every invocation.
 
 -   Reject `<<-`, `->>`, global `assign(...)`, global `rm/remove(...)`, and `source(..., local = FALSE)`.
--   Require `source(...)` to include explicit `local=`.
--   Reject risky process/session operations (`save`, `saveRDS`, `load`, `setwd`, `options`, `Sys.setenv`, `library`, `require`, `attach`, `detach`, `sink`, `system`, `system2`, `q`, `quit`).
--   Keep `APPEND_CODE` scoped to temporary scratch env.
--   Keep `CACHE_CODE` scoped to `codex_cache`; use `CLEAR_CACHE` for teardown.
--   Enforce add-only semantics for `CREATE_NEW_GLOBAL_VARIABLE`.
--   Enforce global leak detection: unexpected added/removed bindings fail invocation.
--   Avoid run-level side-effect toggles; allow side effects only through explicit side-effect capabilities.
--   Files can only generated for temporary use unless the user requests explicitly.
+-   Reject `save`, `saveRDS`, `load`, and file-creation calls in live-session calls.
+-   Reject `setwd`, `options`, `Sys.setenv`, `attach`, `detach`, `sink`, `system`, `system2`, `q`, `quit`.
+-   Keep `library()`/`require()` out of live-session calls unless explicitly requested by user intent.
+-   For graphical commands in live-session calls, enforce `print(...)` around rendering expressions.
+
+### Other rules
+
+-   Clean exported files when no longer needed.
+-   Runtime R errors must be surfaced as `__ERROR__:<message>` in the result payload, never as indefinite waits.
+-   Prefer one live wrapper call to capture state and one live wrapper call to render final result for experimentation tasks.
+-   Avoid sending candidate-by-candidate updates to live RStudio unless the user explicitly asks for that interaction style.
 
 ## Troubleshooting
 
--   `system error 1 (Operation not permitted)` in `~/.local/share/rstudio/log/rpostback.log`: local socket access is blocked in sandbox; rerun that single-segment RPC command with escalated permissions.
--   `rpostback` returns no JSON-RPC `result` envelope: treat as failed RPC and rerun once with escalation if needed.
--   `Timed out waiting for result file ...` with `RPC transport output: {"result":null}`: treat this as unknown-state. The call may still be executing, may have failed before writing the result file, or may have hit a transport fault. Use wrapper-emitted status lines plus `R session feedback after timeout` to disambiguate.
-    -   `INTERACT_STATUS:parse_error`: generated code failed to parse before result file materialization. Fix code generation and rerun.
-    -   `INTERACT_STATUS:unknown:timed_out_no_result_transport_ready`: transport recovered but no result file appeared; prior call outcome is unknown.
-    -   `INTERACT_STATUS:unknown:timed_out_transport_unavailable`: transport was still unavailable after recovery wait; prior call outcome is unknown.
-    -   `INTERACT_STATUS:transport_error:previous_timeout_unresolved`: previous unknown-state timeout is still unresolved. Wait and retry instead of forcing overlapping RPC calls.
--   Live-session checks cannot run: report the limitation and ask whether to continue with elevated session access.
--   `Result expression cannot contain '<-' assignment.`: move assignments to `--append-code`; keep `--set-result-expr` as one single-line read-only expression.
--   `object '<name>' not found` after a previous successful call: object was created in temporary scratch scope and expired; recreate it in the same invocation or persist it with `--cache-code`.
+-   `RPC send timed out after <n>s.`: hard timeout fired while sending to RStudio. Check for lingering wrapper processes and stop them before retrying.
+-   For `RPC send timed out` cases, check whether the live session is busy before retrying:
+    -   Read `"$SESSION_DIR"/properites/executing` (busy when value is `1`).
+    -   Read `"$SESSION_DIR"/properites/blocking_suspend` (lists blockers such as `Waiting for event: console_input` or `A child process is running`).
+    -   Report this busy state to the user explicitly and ask them to finish/interrupt the running console task before retrying wrapper calls.
+-   `rpostback timed out ...` with stale-looking metadata (`abend=1`, dead `env-session-pid`): treat this as a stale snapshot signal first, not a mandatory user refresh. Ensure caller preserves live runtime env vars instead of forcing snapshot env.
+-   `Timed out waiting for result file: ...`: RPC send returned but no result payload arrived in time. Retry once with smaller payload or higher `--timeout`.
+-   If `Timed out waiting for result file` follows `R_STATE_EXPORT`, re-estimate payload size/time, increase both `--rpc-timeout` and `--timeout`, or reduce payload scope and retry once.
+-   Stale `/tmp/codex_rstudio_session-*.lock` with no active wrapper process: remove the stale lock, then retry once.
+-   `rpostback did not return a JSON-RPC result (rc=1)` (including stale-looking `path:` details such as `/home/<user>/<stream>`): treat sandbox restriction as the default diagnosis; rerun the same single-segment command with escalation before attributing failure to the RStudio session.
+-   Stale `rpostback.log` tail can mislead root-cause analysis; if log mtime did not change during the current invocation, do not treat that line as current.
+-   `system error 1 (Operation not permitted)` from `rpostback`: rerun the same single-segment command with escalation.
+-   `timed out` unknown-state: wait for session status and retry once.
+-   `__SYNTAX_ERROR__`: regenerate the live-code snippets; parsing failed before execution.
+-   `__ERROR__:<message>`: runtime error occurred while evaluating generated code (including missing objects); use the message as the failure signal and retry with corrected R snippet.
+-   `Result expression cannot contain '<-' assignment.`: move assignments to `APPEND_CODE`.
+-   Plot not shown: wrap plotting call in `print(...)`, e.g. `print(Seurat::DimPlot(...))`.
