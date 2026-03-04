@@ -67,8 +67,7 @@ Whenever the choice is not obvious, you must take care to identify the minimum s
 -   For every escalated script call, always provide `prefix_rule=["python3","SKILL_DIR/scripts/interact_with_rstudio.py"]`; never include runtime flags/code in the prefix rule.
 -   For interactive bridge sessions in Codex, use `tty=true` so one persistent session id can be reused with `write_stdin` polling.
 -   Do not use `printf` with pipes or heredoc mode.
--   Before complex payloads, run `<<smoke>>` once to confirm bridge responsiveness and output transport.
--   Exit the interactive bridge with `<<quit>>`.
+-   Keep a single live `interact_with_rstudio.py` exec session per run, poll that same session while in flight, and do not start another process until the prior one returns.
 
 ## Step 3. Write code
 
@@ -87,7 +86,7 @@ Once you are in the interactive command-building shell, you can exert the follow
 
 | Capability | Purpose | Scope | Required beforehand |
 |------------------|------------------|------------------|------------------|
-| PREVIEW (`<<preview>>EXPR`) | Return a conservative, short summary for one expression | Temporary execution scope with global read access | None |
+| PREVIEW (`<<preview>>EXPR`) | Return a conservative, short summary for one expression | Temporary scratch env (parent = `.GlobalEnv`) | None |
 | APPEND (bare R statement without command prefix) | Stage helper statements. Primary vehicle for adding code | Temporary scratch env | Estimate computational cost and plan ahead |
 | RESULT (`<<result>>EXPR`) | Set one expression value that will be returned this run | Temporary execution scope with global read access | Inspect object size, dimensions, and class; beware serialization |
 | EXPORT (`<<export>>EXPR`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Estimate export time, evaluated and discuss with user |
@@ -102,6 +101,8 @@ Default to this capability for read-only inspection. `<<preview>>` is conservati
 -   `<<preview>>` is strict: exactly one physical line with one complete expression; no assignments (`<-` prohibited).
 -   Keep prep in APPEND and reserve `<<preview>>` for one final object/expression.
 -   `<<preview>>` cannot be combined with `<<result>>` or `<<export>>` in the same run.
+-   `<<preview>>` evaluates in a scratch env whose parent is `.GlobalEnv`. Consequently, `ls()` and `exists(..., inherits = FALSE)` only inspect scratch bindings.
+-   To inspect globals, prefer `exists("obj", inherits = TRUE)`, `find("obj")`, or `ls(pos = 1)` (position 1 is `.GlobalEnv`).
 
 Example:
 
@@ -140,7 +141,7 @@ print(Seurat::DimPlot(obj))
 
 Use for one final read-only expression when precision matters and preview is insufficient. Each run includes at most one `<<run>>`.
 
-Critical warning: `<<result>>` currently serializes payloads with `dput(...)`. For large or complex objects (especially formal/S4 objects like Seurat internals), this can behave like full structural serialization and may block the live console unexpectedly.
+Critical warning: `<<result>>` serializes payloads with `dput(...)`. For large or complex objects (especially formal/S4 objects like Seurat internals), this can behave like full structural serialization and may block the live console unexpectedly.
 
 -   `<<result>>` is strict: exactly one physical line with one complete expression; no assignments (`<-` prohibited).
 -   Do not place multi-line blocks (`{...}`), loops, or function definitions in `<<result>>`. Stage those with APPEND first.
@@ -214,7 +215,7 @@ res2 <- RunUMAP(obj)
 
 Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 
-## Step 4. Apply options
+## Step 4. Apply options and run
 
 Options are also set interactively using stdin. Use `<<option-name>>VALUE`.
 
@@ -236,7 +237,9 @@ Finally, `<<run>>` the finished R-code.
 
 -   After every `<<run>>` attempt (success or failure), the bridge clears staged capabilities. Re-stage lines explicitly for the next batch.
 
--   Treat tool `yield_time_ms` as output polling only, not cancellation. Keep a single live `interact_with_rstudio.py` exec session per run, poll that same session while `<<run>>` is in flight, and do not start another `<<run>>`/process until the prior one returns.
+-   Keep the session open and poll it for the next batch of commands. `<<quit>>` to exit the interactive bridge when analysis is finished.
+
+-   CAVEAT: `<<quit>>` only terminates the bridge, not the R computation. Treat tool `yield_time_ms` as output polling only, not cancellation.
 
 ## Step 5. Interpret output
 
@@ -301,6 +304,7 @@ Run these checks for every line of code you write.
 -   Before any `<<result>>`, run explicit probes for class/category (`class`, `isS4`), shape (`dim` or `length`), and size (`object.size`).
 -   Whole-object exports are rarely needed. Prefer exporting a minimal payload with only the fields needed for follow-up (embedding coordinates, metadata, etc). Avoid exporting whole objects unless the user explicitly asks.
 -   R functions are slow. Estimate ETA conservatively. Discuss with the user before beginning expensive computations in the live console.
+-   `<<quit>>` only pertains to the bridge. Rstudio usually isn't that responsive to `SIGINT` as well. So there is practically no way to interrupt an R computation once it has begun; be wise before launching one.
 
 ## Troubleshooting
 

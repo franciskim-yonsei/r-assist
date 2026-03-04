@@ -6,6 +6,7 @@ Use this reference when `interact_with_rstudio.py` fails.
 
 -   If a line fails, inspect with simple probes (`class(...)`, `names(...)`, `dim(...)`, `head(...)`) before continuing.
 -   If `<<run>>` unexpectedly fails, run `<<smoke>>`, then use `<<show>>` to verify staged capabilities before retrying.
+-   Run `<<smoke>>` to confirm bridge responsiveness and output transport.
 
 ## Timeout Triage
 
@@ -82,4 +83,4 @@ Rerun the same single-segment command with escalation.
 
 ### `Result expression cannot contain '<-' assignment.`
 
-Move assignments to `APPEND_CODE`.
+Do assignments in APPEND.

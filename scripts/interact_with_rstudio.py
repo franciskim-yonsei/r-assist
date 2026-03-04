@@ -1128,9 +1128,9 @@ def execute_run(state: State, script_dir: Path) -> None:
 def print_help() -> None:
     print(
         "Commands:\n"
-        "  <R statement>                 Append statement in scratch env\n"
+        "  <R statement>                 Append statement in scratch env (parent=.GlobalEnv)\n"
         "  <<append>><R statement>       Explicit append statement\n"
-        "  <<preview>><R expression>     Return conservative short preview for one expression\n"
+        "  <<preview>><R expression>     Read-only preview in scratch env (parent=.GlobalEnv)\n"
         "  <<result>><R expression>      Set one complete single-line result expression\n"
         "  <<export>><R expression>      Export expression via saveRDS and return file path\n"
         "  <<create>><name>:=<expr>      Create new variable in .GlobalEnv\n"
