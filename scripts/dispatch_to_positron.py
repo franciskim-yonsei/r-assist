@@ -8,11 +8,11 @@ import json
 import os
 import re
 import socket
-import subprocess
 import sys
 import time
 import urllib.parse
 import uuid
+from pathlib import Path
 
 try:
     import zmq
@@ -25,17 +25,16 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 
-ARK_PATTERN = re.compile(
-    r"^\s*(\d+)\s+(/\S*positron-r/resources/ark/ark)\s+"
-    r".*--connection_file\s+(/tmp/registration_r-([a-f0-9]+)\.json)\s+.*--session-mode\s+console\b"
-)
+SESSION_MODES = {"console", "notebook"}
 
 
 def usage() -> str:
     return (
         "Usage:\n"
         "  dispatch_to_positron.py --code '<R code>' [--id <jsonrpc-id>] "
-        "[--isolate-code 0|1] [--rpc-timeout <seconds>] [--session-id <id>]\n"
+        "[--isolate-code 0|1] [--rpc-timeout <seconds>] "
+        "[--session-mode console|notebook] [--session-id <id>] "
+        "[--notebook-uri <uri>] [--silent 0|1]\n"
     )
 
 
@@ -43,82 +42,30 @@ def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def _find_active_session(explicit_session_id: str = "") -> tuple[int, str, str]:
-    ps = subprocess.check_output(["ps", "-eo", "pid,args"], text=True)
-    rows: list[tuple[int, str, str]] = []
-    for line in ps.splitlines():
-        match = ARK_PATTERN.match(line)
-        if not match:
-            continue
-        pid = int(match.group(1))
-        reg_path = match.group(3)
-        session_id = f"r-{match.group(4)}"
-        if explicit_session_id and session_id != explicit_session_id:
-            continue
-        rows.append((pid, reg_path, session_id))
-    if not rows:
-        raise RuntimeError("No active Positron R console kernel found")
-    return sorted(rows)[-1]
-
-
 def _read_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
-def _supervisor_logs() -> list[str]:
-    patterns = [
-        "/tmp/kallichore-*.log",
-        "~/.local/state/positron/logs/*/exthost*/positron.positron-supervisor/Kernel Supervisor.log",
-        "~/.positron-server/data/logs/*/exthost*/positron.positron-supervisor/Kernel Supervisor.log",
-    ]
+def _normalize_notebook_uri(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", normalized):
+        return normalized
+    return Path(normalized).expanduser().resolve().as_uri()
+
+
+def _supervisor_connection_files() -> list[str]:
     files: list[str] = []
     seen: set[str] = set()
-    for pattern in patterns:
-        for path in glob.glob(os.path.expanduser(pattern)):
-            if path in seen:
-                continue
-            seen.add(path)
-            files.append(path)
-    files.sort(key=lambda path: os.path.getmtime(path), reverse=True)
-    return files
-
-
-def _kallichore_connection_file_from_supervisor_log(log_file: str) -> str | None:
-    try:
-        with open(log_file, "r", encoding="utf-8", errors="ignore") as handle:
-            for line in reversed(handle.readlines()):
-                match = re.search(r"Generated connection file path:\s+(\S+\.json)\b", line)
-                if match:
-                    return match.group(1)
-                match = re.search(r"Streaming Kallichore server logs (?:from|at)\s+(\S+\.log)\b", line)
-                if match:
-                    return re.sub(r"\.log$", ".json", match.group(1))
-    except FileNotFoundError:
-        return None
-    return None
-
-
-def _find_kallichore_connection(session_id: str, reg_path: str) -> dict:
-    session_marker = f'Wrote registration file for session {session_id} at "{reg_path}"'
-    for log_file in _supervisor_logs():
-        try:
-            with open(log_file, "r", encoding="utf-8", errors="ignore") as handle:
-                for line in reversed(handle.readlines()):
-                    if session_marker not in line:
-                        continue
-                    if log_file.startswith("/tmp/kallichore-") and log_file.endswith(".log"):
-                        conn_path = re.sub(r"\.log$", ".json", log_file)
-                    else:
-                        conn_path = _kallichore_connection_file_from_supervisor_log(log_file)
-                    if not conn_path or not os.path.exists(conn_path):
-                        continue
-                    payload = _read_json(conn_path)
-                    if "socket_path" in payload and "bearer_token" in payload:
-                        return payload
-        except FileNotFoundError:
+    for path in glob.glob("/tmp/kallichore-*.json"):
+        if path in seen:
             continue
-    raise RuntimeError(f"No Kallichore connection info found for {session_id}")
+        seen.add(path)
+        files.append(path)
+    files.sort(key=lambda item: os.path.getmtime(item), reverse=True)
+    return files
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -132,8 +79,149 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self._socket_path)
 
 
-def _find_connection_info(session_id: str, reg_path: str) -> dict:
-    server = _find_kallichore_connection(session_id, reg_path)
+def _list_supervisor_sessions(server: dict) -> list[dict]:
+    socket_path = server.get("socket_path")
+    bearer_token = server.get("bearer_token")
+    if not socket_path or not bearer_token:
+        return []
+
+    conn = _UnixHTTPConnection(str(socket_path), timeout=4.0)
+    try:
+        conn.request("GET", "/sessions", headers={"Authorization": f"Bearer {bearer_token}"})
+        response = conn.getresponse()
+        body = response.read()
+    except OSError:
+        return []
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    if response.status != 200:
+        return []
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return []
+
+    sessions = payload.get("sessions", [])
+    if not isinstance(sessions, list):
+        return []
+    return sessions
+
+
+def _rank_session(session: dict) -> tuple[int, str]:
+    process_id = session.get("process_id")
+    try:
+        pid_rank = int(process_id)
+    except (TypeError, ValueError):
+        pid_rank = -1
+    started_rank = str(session.get("started") or "")
+    return pid_rank, started_rank
+
+
+def _describe_session(session: dict) -> str:
+    session_id = str(session.get("session_id") or "<unknown>")
+    session_mode = str(session.get("session_mode") or "<unknown>")
+    working_directory = str(session.get("working_directory") or "").strip()
+    notebook_uri = str(session.get("notebook_uri") or "").strip()
+    started = str(session.get("started") or "").strip()
+
+    parts = [session_id, f"mode={session_mode}"]
+    if notebook_uri:
+        parts.append(f"notebook={notebook_uri}")
+    elif working_directory:
+        parts.append(f"cwd={working_directory}")
+    if started:
+        parts.append(f"started={started}")
+    return ", ".join(parts)
+
+
+def _format_session_candidates(sessions: list[dict]) -> str:
+    if not sessions:
+        return ""
+    ordered = sorted(sessions, key=_rank_session)
+    return "\n".join(f"- {_describe_session(session)}" for session in ordered)
+
+
+def _registration_path_for_session(session_id: str) -> str:
+    return f"/tmp/registration_{session_id}.json"
+
+
+def _find_target_session(
+    session_mode: str,
+    explicit_session_id: str = "",
+    notebook_uri: str = "",
+) -> tuple[dict, dict]:
+    normalized_uri = _normalize_notebook_uri(notebook_uri)
+    candidates: list[tuple[dict, dict]] = []
+
+    for conn_path in _supervisor_connection_files():
+        try:
+            server = _read_json(conn_path)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+
+        for session in _list_supervisor_sessions(server):
+            if not isinstance(session, dict):
+                continue
+            if session.get("language") != "R":
+                continue
+            if not session.get("connected"):
+                continue
+            if session.get("session_mode") != session_mode:
+                continue
+            session_id = str(session.get("session_id") or "").strip()
+            if not session_id:
+                continue
+            reg_path = _registration_path_for_session(session_id)
+            if not os.path.exists(reg_path):
+                continue
+            if explicit_session_id and session_id != explicit_session_id:
+                continue
+            if normalized_uri:
+                candidate_uri = _normalize_notebook_uri(str(session.get("notebook_uri") or ""))
+                if candidate_uri != normalized_uri:
+                    continue
+            candidates.append((server, session))
+
+    if explicit_session_id:
+        if not candidates:
+            raise RuntimeError(f"No connected Positron R session found for session id {explicit_session_id}")
+        return sorted(candidates, key=lambda item: _rank_session(item[1]))[-1]
+
+    if normalized_uri:
+        if not candidates:
+            raise RuntimeError(f"No connected Positron notebook session found for {normalized_uri}")
+        return sorted(candidates, key=lambda item: _rank_session(item[1]))[-1]
+
+    if session_mode == "notebook":
+        if not candidates:
+            raise RuntimeError("No connected Positron R notebook kernel found")
+        if len(candidates) > 1:
+            details = _format_session_candidates([session for _, session in candidates])
+            raise RuntimeError(
+                "Multiple connected Positron notebook kernels found. "
+                "Provide --notebook-uri or --session-id.\n"
+                f"{details}"
+            )
+        return candidates[0]
+
+    if not candidates:
+        raise RuntimeError("No active Positron R console kernel found")
+    if len(candidates) > 1:
+        details = _format_session_candidates([session for _, session in candidates])
+        raise RuntimeError(
+            "Multiple connected Positron R console sessions found. "
+            "Provide --session-id.\n"
+            f"{details}"
+        )
+    return candidates[0]
+
+
+def _find_connection_info(server: dict, session_id: str) -> dict:
     socket_path = server.get("socket_path")
     bearer_token = server.get("bearer_token")
     if not socket_path or not bearer_token:
@@ -203,10 +291,23 @@ def _wrap_code(code: str, isolate_code: str) -> str:
     raise RuntimeError(f"Invalid --isolate-code value: {isolate_code} (use 0 or 1)")
 
 
-def execute_code(code: str, rpc_timeout_seconds: int, explicit_session_id: str = "") -> int:
-    _, reg_path, session_id = _find_active_session(explicit_session_id)
+def execute_code(
+    code: str,
+    rpc_timeout_seconds: int,
+    session_mode: str = "console",
+    explicit_session_id: str = "",
+    notebook_uri: str = "",
+    silent: bool = False,
+) -> int:
+    server, session = _find_target_session(
+        session_mode=session_mode,
+        explicit_session_id=explicit_session_id,
+        notebook_uri=notebook_uri,
+    )
+    session_id = str(session["session_id"])
+    reg_path = _registration_path_for_session(session_id)
     registration = _read_json(reg_path)
-    connection_info = _find_connection_info(session_id, reg_path)
+    connection_info = _find_connection_info(server, session_id)
 
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.DEALER)
@@ -217,33 +318,38 @@ def execute_code(code: str, rpc_timeout_seconds: int, explicit_session_id: str =
 
     request = {
         "code": code,
-        "silent": False,
+        "silent": bool(silent),
         "store_history": False,
         "allow_stdin": False,
         "stop_on_error": True,
         "user_expressions": {},
     }
-    session = uuid.uuid4().hex
+    session_uuid = uuid.uuid4().hex
     sign = _signer(registration["key"])
 
     try:
-        sock.send_multipart(_build_message(sign, session, "execute_request", request))
+        sock.send_multipart(_build_message(sign, session_uuid, "execute_request", request))
         reply = sock.recv_multipart()
     finally:
         sock.close()
 
-    header, _ = _parse_message(reply)
+    header, content = _parse_message(reply)
     if header.get("msg_type") != "execute_reply":
         raise RuntimeError(f"Unexpected reply type: {header.get('msg_type')}")
+    if content.get("status") != "ok":
+        raise RuntimeError(str(content))
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--code", default="")
+    parser.add_argument("--session-mode", default="console")
     parser.add_argument("--session-id", default="")
+    parser.add_argument("--notebook-uri", default="")
     parser.add_argument("--id", default="1")
     parser.add_argument("--isolate-code", default="1")
+    parser.add_argument("--silent", default="0")
     parser.add_argument("--rpc-timeout", default=os.environ.get("RPC_TIMEOUT_SECONDS", "12"))
     parser.add_argument("-h", "--help", action="store_true")
 
@@ -262,8 +368,18 @@ def main() -> int:
         eprint(usage())
         return 2
 
+    if args.session_mode not in SESSION_MODES:
+        eprint(f"Invalid --session-mode value: {args.session_mode} (use console or notebook)")
+        eprint(usage())
+        return 2
+
     if re.fullmatch(r"\d+", str(args.rpc_timeout)) is None:
         eprint(f"Invalid --rpc-timeout value: {args.rpc_timeout} (use integer seconds)")
+        eprint(usage())
+        return 2
+
+    if args.silent not in {"0", "1"}:
+        eprint(f"Invalid --silent value: {args.silent} (use 0 or 1)")
         eprint(usage())
         return 2
 
@@ -271,7 +387,10 @@ def main() -> int:
         return execute_code(
             code=_wrap_code(args.code, args.isolate_code),
             rpc_timeout_seconds=int(args.rpc_timeout),
+            session_mode=args.session_mode.strip(),
             explicit_session_id=args.session_id.strip(),
+            notebook_uri=args.notebook_uri.strip(),
+            silent=args.silent == "1",
         )
     except Exception as exc:
         eprint(str(exc))

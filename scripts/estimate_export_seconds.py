@@ -13,12 +13,16 @@ def usage() -> str:
     return (
         "Usage:\n"
         "  estimate_export_seconds.py --session <rstudio|positron> "
-        "[--timeout <seconds>] [--rpc-timeout <seconds>] '<R expression>'\n\n"
+        "[--timeout <seconds>] [--rpc-timeout <seconds>] "
+        "[--positron-session-mode console|notebook] [--positron-session-id <id>] "
+        "[--positron-notebook-uri <path-or-uri>] '<R expression>'\n\n"
         "Description:\n"
         "  Evaluate object size for the provided R expression in the selected live R session and print:\n"
         "    max(5, ceiling(0.5 * size_in_MB + 10))\n\n"
         "Examples:\n"
         "  estimate_export_seconds.py --session positron 'total'\n"
+        "  estimate_export_seconds.py --session positron --positron-session-mode notebook "
+        "--positron-notebook-uri /abs/path/notebook.ipynb 'foo'\n"
         "  estimate_export_seconds.py --session rstudio --timeout 120 --rpc-timeout 120 'list(meta = total[[\"meta.data\"]])'\n"
     )
 
@@ -60,6 +64,9 @@ def main() -> int:
     parser.add_argument("--session", default="")
     parser.add_argument("--timeout", default="30")
     parser.add_argument("--rpc-timeout", default="30")
+    parser.add_argument("--positron-session-mode", default="console")
+    parser.add_argument("--positron-session-id", default="")
+    parser.add_argument("--positron-notebook-uri", default="")
     parser.add_argument("-h", "--help", action="store_true")
     parser.add_argument("expr", nargs=argparse.REMAINDER)
 
@@ -80,6 +87,24 @@ def main() -> int:
     if not is_int_string(args.rpc_timeout):
         eprint("--rpc-timeout must be an integer number of seconds.")
         return 2
+
+    if args.session != "positron":
+        if args.positron_session_mode != "console":
+            eprint("--positron-session-mode is only supported for --session=positron.")
+            return 2
+        if args.positron_session_id.strip():
+            eprint("--positron-session-id is only supported for --session=positron.")
+            return 2
+        if args.positron_notebook_uri.strip():
+            eprint("--positron-notebook-uri is only supported for --session=positron.")
+            return 2
+    else:
+        if args.positron_session_mode not in {"console", "notebook"}:
+            eprint("--positron-session-mode must be either 'console' or 'notebook'.")
+            return 2
+        if args.positron_notebook_uri.strip() and args.positron_session_mode != "notebook":
+            eprint("--positron-notebook-uri requires --positron-session-mode notebook.")
+            return 2
 
     if not args.expr:
         eprint(usage())
@@ -128,6 +153,14 @@ def main() -> int:
             "--rpc-timeout",
             args.rpc_timeout,
         ]
+        if args.session == "positron":
+            cmd += ["--session-mode", args.positron_session_mode]
+            if args.positron_session_id.strip():
+                cmd += ["--session-id", args.positron_session_id.strip()]
+            if args.positron_notebook_uri.strip():
+                cmd += ["--notebook-uri", args.positron_notebook_uri.strip()]
+            if args.positron_session_mode == "notebook":
+                cmd += ["--silent", "1"]
         proc = subprocess.run(cmd, capture_output=True, text=True)
 
         if proc.returncode != 0:

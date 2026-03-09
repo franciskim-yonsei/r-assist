@@ -12,13 +12,14 @@ Interrogate the live R session via `python3 SKILL_DIR/scripts/talk_to_r.py` (Con
 ## Workflow
 
 1.  Decide the backend first. If it is not explicit, stop and ask `Which backend are you using, RStudio or Positron?`
-2.  Decide the mode of operation: A, B, or C. Discuss with user if unsure.
-3.  Use `python3 SKILL_DIR/scripts/talk_to_r.py --session=<backend>` to start an interactive command-building shell.
-4.  Use your defined capabilities to build the R code.
-5.  Apply appropriate options, then run the code.
-6.  Inspect output and iterate.
-7.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
-8.  Present report. Strongly consider visualizing key arguments.
+2.  If the backend is Positron, decide whether the target is the console kernel or a notebook kernel. Do not guess.
+3.  Decide the mode of operation: A, B, or C. Discuss with user if unsure.
+4.  Use `python3 SKILL_DIR/scripts/talk_to_r.py --session=<backend>` to start an interactive command-building shell.
+5.  Use your defined capabilities to build the R code.
+6.  Apply appropriate options, then run the code.
+7.  Inspect output and iterate.
+8.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
+9.  Present report. Strongly consider visualizing key arguments.
 
 ## Step 1. Decide backend
 
@@ -30,7 +31,17 @@ Interrogate the live R session via `python3 SKILL_DIR/scripts/talk_to_r.py` (Con
 This dictates the option used in later script invocation:
 
 -   Use `--session=rstudio` for RStudio/rsession-backed consoles.
--   Use `--session=positron` for Positron/ark-backed consoles.
+-   Use `--session=positron` for Positron/ark-backed sessions.
+
+### Positron subtarget
+
+Once the backend is known to be Positron, decide whether the request refers to the console kernel or a notebook kernel.
+
+-   If the prompt explicitly mentions a notebook, `.ipynb`, a notebook cell, or a notebook variable pane, target the notebook kernel.
+-   If the prompt explicitly mentions the Positron console, target the console kernel.
+-   If the prompt only says `Positron` / `live Positron R session` and does not identify console vs notebook, ask back before doing anything else: `Are you using the Positron console or a notebook kernel?`
+-   If the user refers to a specific notebook, prefer the absolute notebook path when available. If multiple Positron notebooks could plausibly match and no path is given, ask back instead of guessing.
+-   If multiple Positron sessions of the chosen type are open, do not guess. Use the candidate session ids surfaced by the bridge error, ask the user which one they want, then set `<<positron-session-id>>...`.
 
 ## Step 2. Decide mode of operation
 
@@ -82,6 +93,9 @@ Whenever the choice is not obvious, you must take care to identify the minimum s
 -   Do not use `printf` with pipes or heredoc mode.
 -   Keep a single live `talk_to_r.py` exec session per run, poll that same session while in flight, and do not start another process until the prior one returns.
 -   Positron backend dependency: `--session=positron` requires `python3` to import `zmq` because it talks directly to the Jupyter ZeroMQ shell channel. On Debian/Ubuntu, install `python3-zmq`.
+-   For Positron notebook kernels, immediately set the target before running capabilities: `<<positron-session-mode>>notebook` then `<<positron-notebook-uri>>/absolute/path/to/notebook.ipynb`.
+-   Use `<<positron-session-id>>...` only when the user already gave a specific session id or you have one from prior confirmed context.
+-   If the request is for the Positron console, either leave the default target alone or set `<<positron-session-mode>>console` explicitly.
 
 ## Step 4. Write code
 

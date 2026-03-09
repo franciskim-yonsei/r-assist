@@ -70,6 +70,7 @@ LIKELY_INCOMPLETE_SUFFIX_PATTERN = re.compile(
 
 COMMAND_PREFIX_PATTERN = re.compile(r"^\s*<<([A-Za-z][A-Za-z0-9-]*)>>(.*)$")
 SESSION_BACKENDS = {"rstudio", "positron"}
+POSITRON_SESSION_MODES = {"console", "notebook"}
 
 
 @dataclass
@@ -88,6 +89,9 @@ class State:
     out_path: str = ""
     timeout_seconds: str = "8"
     rpc_timeout_seconds: str = "12"
+    positron_session_mode: str = "console"
+    positron_session_id: str = ""
+    positron_notebook_uri: str = ""
     benchmark_mode: bool = False
     benchmark_unit: str = "SECONDS"
     print_code: bool = False
@@ -132,6 +136,9 @@ KNOWN_PREFIXES = {
     "benchmark",
     "benchmark-unit",
     "print-code",
+    "positron-session-mode",
+    "positron-session-id",
+    "positron-notebook-uri",
 }
 
 
@@ -148,7 +155,23 @@ def parse_cli_args(argv: List[str]) -> argparse.Namespace:
         "--session",
         required=True,
         choices=sorted(SESSION_BACKENDS),
-        help="Target backend for the live R console.",
+        help="Target backend for the live R session.",
+    )
+    parser.add_argument(
+        "--positron-session-mode",
+        default="console",
+        choices=sorted(POSITRON_SESSION_MODES),
+        help="Target Positron session mode.",
+    )
+    parser.add_argument(
+        "--positron-session-id",
+        default="",
+        help="Target a specific Positron session id.",
+    )
+    parser.add_argument(
+        "--positron-notebook-uri",
+        default="",
+        help="Target a specific Positron notebook by absolute path or file:/// URI.",
     )
     return parser.parse_args(argv)
 
@@ -668,8 +691,11 @@ def build_prompt(state: State) -> str:
     preview_set = 1 if state.preview_expr else 0
     result_set = 1 if state.result_expr else 0
     export_set = 1 if state.state_export_expr else 0
+    backend_label = state.session_backend
+    if state.session_backend == "positron":
+        backend_label = f"positron/{state.positron_session_mode}"
     return (
-        f"talk-to-r[{state.session_backend},pending={pending},preview={preview_set},"
+        f"talk-to-r[{backend_label},pending={pending},preview={preview_set},"
         f"result={result_set},export={export_set}]> "
     )
 
@@ -728,6 +754,21 @@ def validate_state_for_run(state: State) -> RunContext:
             raise ValidationError("session-dir is only supported for --session=rstudio.")
         if state.rpostback_bin:
             raise ValidationError("rpostback-bin is only supported for --session=rstudio.")
+
+    if state.session_backend != "positron":
+        if state.positron_session_mode != "console":
+            raise ValidationError("positron-session-mode is only supported for --session=positron.")
+        if state.positron_session_id:
+            raise ValidationError("positron-session-id is only supported for --session=positron.")
+        if state.positron_notebook_uri:
+            raise ValidationError("positron-notebook-uri is only supported for --session=positron.")
+    else:
+        if state.positron_session_mode not in POSITRON_SESSION_MODES:
+            raise ValidationError("positron-session-mode must be either console or notebook.")
+        if state.positron_notebook_uri and state.positron_session_mode != "notebook":
+            raise ValidationError(
+                "positron-notebook-uri requires positron-session-mode to be notebook."
+            )
 
     for snippet in state.append_code_snippets:
         validate_append_snippet(snippet)
@@ -1187,6 +1228,14 @@ def execute_run(state: State, script_dir: Path) -> None:
             rpc_args += ["--session-dir", str(session_dir)]
         if state.session_backend == "rstudio" and state.rpostback_bin:
             rpc_args += ["--rpostback-bin", state.rpostback_bin]
+        if state.session_backend == "positron":
+            rpc_args += ["--session-mode", state.positron_session_mode]
+            if state.positron_session_id:
+                rpc_args += ["--session-id", state.positron_session_id]
+            if state.positron_notebook_uri:
+                rpc_args += ["--notebook-uri", state.positron_notebook_uri]
+            if state.positron_session_mode == "notebook":
+                rpc_args += ["--silent", "1"]
 
         if run_ctx.expect_result:
             Path(run_ctx.out_path).write_text("", encoding="utf-8")
@@ -1253,6 +1302,9 @@ def print_help() -> None:
         "  <<session-dir>><dir>          Override active RStudio session directory (RStudio only)\n"
         "  <<id>><int>                   JSON-RPC request id\n"
         "  <<rpostback-bin>><path>       Override rpostback binary (RStudio only)\n"
+        "  <<positron-session-mode>><console|notebook>  Target Positron console or notebook kernel\n"
+        "  <<positron-session-id>><id>   Target one Positron session id (Positron only)\n"
+        "  <<positron-notebook-uri>><path-or-uri>  Target a Positron notebook by absolute path or file:/// URI\n"
         "  <<out>><path>                 Result output file\n"
         "  <<timeout>><seconds>          Wait timeout for result file\n"
         "  <<rpc-timeout>><seconds>      Hard timeout for run dispatch\n"
@@ -1283,6 +1335,9 @@ def show_state(state: State) -> None:
     print(f"  session-dir: {state.session_dir or '<auto>'}")
     print(f"  id: {state.request_id}")
     print(f"  rpostback-bin: {state.rpostback_bin or '<default>'}")
+    print(f"  positron-session-mode: {state.positron_session_mode}")
+    print(f"  positron-session-id: {state.positron_session_id or '<auto>'}")
+    print(f"  positron-notebook-uri: {state.positron_notebook_uri or '<auto>'}")
     print(f"  out: {state.out_path or '<tmp-if-needed>'}")
     print(f"  timeout: {state.timeout_seconds}")
     print(f"  rpc-timeout: {state.rpc_timeout_seconds}")
@@ -1364,6 +1419,15 @@ def apply_input_line(state: State, line: str) -> Optional[str]:
         state.request_id = payload.strip()
     elif key == "rpostback-bin":
         state.rpostback_bin = payload.strip()
+    elif key == "positron-session-mode":
+        normalized_mode = payload.strip().lower()
+        if normalized_mode not in POSITRON_SESSION_MODES:
+            raise ValidationError("positron-session-mode must be either console or notebook.")
+        state.positron_session_mode = normalized_mode
+    elif key == "positron-session-id":
+        state.positron_session_id = payload.strip()
+    elif key == "positron-notebook-uri":
+        state.positron_notebook_uri = payload.strip()
     elif key == "out":
         state.out_path = payload.strip()
     elif key == "timeout":
@@ -1384,11 +1448,20 @@ def apply_input_line(state: State, line: str) -> Optional[str]:
     return None
 
 
-def repl(session_backend: str) -> int:
-    state = State(session_backend=session_backend)
+def repl(args: argparse.Namespace) -> int:
+    state = State(
+        session_backend=args.session,
+        positron_session_mode=args.positron_session_mode,
+        positron_session_id=args.positron_session_id.strip(),
+        positron_notebook_uri=args.positron_notebook_uri.strip(),
+    )
     script_dir = Path(__file__).resolve().parent
 
-    print(f"talk_to_r ready (backend={session_backend}). Type '<<help>>' for commands.")
+    ready_message = f"talk_to_r ready (backend={state.session_backend}"
+    if state.session_backend == "positron":
+        ready_message += f", target={state.positron_session_mode}"
+    ready_message += "). Type '<<help>>' for commands."
+    print(ready_message)
     while True:
         try:
             line = input(build_prompt(state))
@@ -1424,4 +1497,4 @@ def repl(session_backend: str) -> int:
 
 if __name__ == "__main__":
     args = parse_cli_args(sys.argv[1:])
-    sys.exit(repl(args.session))
+    sys.exit(repl(args))
