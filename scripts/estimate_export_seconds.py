@@ -12,13 +12,14 @@ from pathlib import Path
 def usage() -> str:
     return (
         "Usage:\n"
-        "  estimate_export_seconds.py [--timeout <seconds>] [--rpc-timeout <seconds>] '<R expression>'\n\n"
+        "  estimate_export_seconds.py --session <rstudio|positron> "
+        "[--timeout <seconds>] [--rpc-timeout <seconds>] '<R expression>'\n\n"
         "Description:\n"
-        "  Evaluate object size for the provided R expression in the live RStudio session and print:\n"
+        "  Evaluate object size for the provided R expression in the selected live R session and print:\n"
         "    max(5, ceiling(0.5 * size_in_MB + 10))\n\n"
         "Examples:\n"
-        "  estimate_export_seconds.py 'total'\n"
-        "  estimate_export_seconds.py --timeout 120 --rpc-timeout 120 'list(meta = total[[\"meta.data\"]])'\n"
+        "  estimate_export_seconds.py --session positron 'total'\n"
+        "  estimate_export_seconds.py --session rstudio --timeout 120 --rpc-timeout 120 'list(meta = total[[\"meta.data\"]])'\n"
     )
 
 
@@ -37,18 +38,26 @@ def escape_for_r_string(value: str) -> str:
     return value
 
 
-def find_rpc_script(script_dir: Path) -> Path:
-    local = script_dir / "communicate_with_rstudio_console_with_rpc_low_level.py"
+def find_rpc_script(script_dir: Path, session_backend: str) -> Path:
+    script_name = {
+        "rstudio": "dispatch_to_rstudio.py",
+        "positron": "dispatch_to_positron.py",
+    }.get(session_backend)
+    if not script_name:
+        raise FileNotFoundError(f"Unsupported session backend: {session_backend}")
+
+    local = script_dir / script_name
     if local.exists():
         return local
-    home = Path.home() / ".codex/skills/r-assist/scripts/communicate_with_rstudio_console_with_rpc_low_level.py"
+    home = Path.home() / ".codex/skills/r-assist/scripts" / script_name
     if home.exists():
         return home
-    raise FileNotFoundError("Unable to locate communicate_with_rstudio_console_with_rpc_low_level.py")
+    raise FileNotFoundError(f"Unable to locate {script_name}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--session", default="")
     parser.add_argument("--timeout", default="30")
     parser.add_argument("--rpc-timeout", default="30")
     parser.add_argument("-h", "--help", action="store_true")
@@ -62,6 +71,10 @@ def main() -> int:
 
     if not is_int_string(args.timeout):
         eprint("--timeout must be an integer number of seconds.")
+        return 2
+
+    if args.session not in {"rstudio", "positron"}:
+        eprint("--session must be either 'rstudio' or 'positron'.")
         return 2
 
     if not is_int_string(args.rpc_timeout):
@@ -79,7 +92,7 @@ def main() -> int:
 
     script_dir = Path(__file__).resolve().parent
     try:
-        rpc_script = find_rpc_script(script_dir)
+        rpc_script = find_rpc_script(script_dir, args.session)
     except FileNotFoundError as exc:
         eprint(str(exc))
         return 1

@@ -1,4 +1,4 @@
 interface:
   display_name: "Assist with R analysis"
-  short_description: "Execute code in active RStudio sessions via RPC"
-  default_prompt: "Use $r-assist capabilities to interrogate the live Rstudio session. Decide between one-time direct interaction or opening up a background R session for multi-step analysis."
+  short_description: "Execute code in active R sessions via RStudio or Positron backends"
+  default_prompt: "Use $r-assist capabilities to interrogate the live R session. If the backend is not explicit, ask which backend is in use: RStudio or Positron. If it is explicit, proceed immediately with that backend and then decide between one-time direct interaction or opening a background R session for multi-step analysis."

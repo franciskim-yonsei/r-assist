@@ -11,12 +11,12 @@ from pathlib import Path
 def usage() -> str:
     return (
         "Usage:\n"
-        "  communicate_with_rstudio_console_with_rpc_low_level.py --code '<R code>' "
+        "  dispatch_to_rstudio.py --code '<R code>' "
         "[--session-dir <dir>] [--id <jsonrpc-id>] [--rpostback-bin <path>] "
         "[--isolate-code 0|1] [--rpc-timeout <seconds>]\n\n"
         "Examples:\n"
-        "  communicate_with_rstudio_console_with_rpc_low_level.py --code 'print(\"Hello from codex!\")'\n"
-        "  communicate_with_rstudio_console_with_rpc_low_level.py --code 'dput(x, file = \"/tmp/x.txt\")' --id 7\n"
+        "  dispatch_to_rstudio.py --code 'print(\"Hello from codex!\")'\n"
+        "  dispatch_to_rstudio.py --code 'dput(x, file = \"/tmp/x.txt\")' --id 7\n"
     )
 
 

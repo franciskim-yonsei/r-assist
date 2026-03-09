@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Use this reference when `interact_with_rstudio.py` fails.
+Use this reference when `talk_to_r.py` fails.
 
 ## First-aid for general errors
 
@@ -31,6 +31,14 @@ Treat this as a stale snapshot signal first, not mandatory user refresh.
 
 1.  Preserve live runtime env vars (`RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, `RSTUDIO_SESSION_PID`) when present.
 2.  Avoid forcing snapshot env values from `suspended-session-data/environment_vars`.
+3.  Retry once.
+
+### `dispatch_to_positron.py requires pyzmq ...`
+
+The Positron backend is missing its Python ZeroMQ dependency.
+
+1.  Verify the backend is actually `--session=positron`.
+2.  Install `python3-zmq` (Debian/Ubuntu) or otherwise make `zmq` importable from the default `python3`.
 3.  Retry once.
 
 ### `Timed out waiting for result file: ...`

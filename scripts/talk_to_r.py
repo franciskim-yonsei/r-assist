@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import re
 import shutil
@@ -68,10 +69,12 @@ LIKELY_INCOMPLETE_SUFFIX_PATTERN = re.compile(
 )
 
 COMMAND_PREFIX_PATTERN = re.compile(r"^\s*<<([A-Za-z][A-Za-z0-9-]*)>>(.*)$")
+SESSION_BACKENDS = {"rstudio", "positron"}
 
 
 @dataclass
 class State:
+    session_backend: str
     append_code_snippets: List[str] = field(default_factory=list)
     preview_expr: str = ""
     result_expr: str = ""
@@ -134,6 +137,20 @@ KNOWN_PREFIXES = {
 
 def trim(value: str) -> str:
     return value.strip()
+
+
+def parse_cli_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="talk_to_r.py",
+        description="Interactive R bridge with explicit backend selection.",
+    )
+    parser.add_argument(
+        "--session",
+        required=True,
+        choices=sorted(SESSION_BACKENDS),
+        help="Target backend for the live R console.",
+    )
+    return parser.parse_args(argv)
 
 
 def contains_regex(value: str, regex: str) -> bool:
@@ -512,7 +529,7 @@ def result_file_size_bytes(path: Path) -> int:
         return 0
 
 
-def diagnose_result_wait_timeout(out_path: Path, session_dir: Path) -> None:
+def diagnose_result_wait_timeout_rstudio(out_path: Path, session_dir: Path) -> None:
     executing_value = get_executing_flag_value(session_dir)
     out_exists = out_path.exists()
     out_size = result_file_size_bytes(out_path)
@@ -563,6 +580,31 @@ def diagnose_result_wait_timeout(out_path: Path, session_dir: Path) -> None:
     if pid_state in {"dead_or_not_rsession", "invalid"} or abend_value == "1":
         print("Possible cause: session snapshot points to a dead/restarted rsession.", file=sys.stderr)
         print("Action: re-resolve live runtime env vars and retry once.", file=sys.stderr)
+
+
+def diagnose_result_wait_timeout_positron(out_path: Path) -> None:
+    out_exists = out_path.exists()
+    out_size = result_file_size_bytes(out_path)
+    causes: List[str] = []
+    if out_exists and out_size == 0:
+        causes.append("handoff_or_write_delay")
+    if not out_exists:
+        causes.append("output_path_unavailable")
+    if not causes:
+        causes.append("unknown")
+
+    print(f"Timeout diagnostics: causes={','.join(causes)}", file=sys.stderr)
+    print(
+        f"Timeout diagnostics: output_exists={1 if out_exists else 0} output_size_bytes={out_size}",
+        file=sys.stderr,
+    )
+
+    if out_exists and out_size == 0:
+        print("Possible cause: compute finished but result handoff/file write lagged.", file=sys.stderr)
+        print("Action: increase timeout, reduce payload size, and retry once.", file=sys.stderr)
+    if not out_exists:
+        print("Possible cause: output file was removed or inaccessible while waiting.", file=sys.stderr)
+        print("Action: verify /tmp availability and file permissions, then retry.", file=sys.stderr)
 
 
 def parse_bool(value: str) -> bool:
@@ -627,12 +669,15 @@ def build_prompt(state: State) -> str:
     result_set = 1 if state.result_expr else 0
     export_set = 1 if state.state_export_expr else 0
     return (
-        f"rstudio-bridge[pending={pending},preview={preview_set},"
+        f"talk-to-r[{state.session_backend},pending={pending},preview={preview_set},"
         f"result={result_set},export={export_set}]> "
     )
 
 
 def validate_state_for_run(state: State) -> RunContext:
+    if state.session_backend not in SESSION_BACKENDS:
+        raise ValidationError(f"Unknown session backend: {state.session_backend}")
+
     has_append = bool(state.append_code_snippets)
     has_preview = bool(state.preview_expr)
     has_result = bool(state.result_expr)
@@ -678,6 +723,12 @@ def validate_state_for_run(state: State) -> RunContext:
     ensure_int_string(state.timeout_seconds, "timeout")
     ensure_int_string(state.rpc_timeout_seconds, "rpc-timeout")
 
+    if state.session_backend != "rstudio":
+        if state.session_dir:
+            raise ValidationError("session-dir is only supported for --session=rstudio.")
+        if state.rpostback_bin:
+            raise ValidationError("rpostback-bin is only supported for --session=rstudio.")
+
     for snippet in state.append_code_snippets:
         validate_append_snippet(snippet)
 
@@ -722,14 +773,23 @@ def validate_state_for_run(state: State) -> RunContext:
     )
 
 
-def find_rpc_script(script_dir: Path) -> Path:
-    local_rpc_py = script_dir / "communicate_with_rstudio_console_with_rpc_low_level.py"
-    if local_rpc_py.exists():
-        return local_rpc_py
-    home_rpc_py = Path.home() / ".codex/skills/r-assist/scripts/communicate_with_rstudio_console_with_rpc_low_level.py"
-    if home_rpc_py.exists():
-        return home_rpc_py
-    raise RunError("Unable to locate communicate_with_rstudio_console_with_rpc_low_level.py")
+def find_dispatch_script(script_dir: Path, session_backend: str) -> Path:
+    script_name = {
+        "rstudio": "dispatch_to_rstudio.py",
+        "positron": "dispatch_to_positron.py",
+    }.get(session_backend)
+    if not script_name:
+        raise RunError(f"Unsupported session backend: {session_backend}")
+
+    local_script = script_dir / script_name
+    if local_script.exists():
+        return local_script
+
+    home_script = Path.home() / ".codex/skills/r-assist/scripts" / script_name
+    if home_script.exists():
+        return home_script
+
+    raise RunError(f"Unable to locate {script_name}")
 
 
 def check_r_code_parse(r_code: str, expect_result: bool, out_path: str) -> None:
@@ -1032,25 +1092,17 @@ def run_rpc_dispatch(rpc_script: Path, rpc_args: List[str], suppress_stdout: boo
     return proc.returncode
 
 
-def run_low_level_passthrough(argv: List[str], script_dir: Path) -> int:
-    try:
-        rpc_script = find_rpc_script(script_dir)
-    except RunError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    proc = subprocess.run(["python3", str(rpc_script)] + argv)
-    return proc.returncode
-
-
 def execute_run(state: State, script_dir: Path) -> None:
     run_ctx = validate_state_for_run(state)
     success = False
 
     try:
-        session_dir = resolve_session_dir(state)
-        load_session_environment(session_dir)
         r_code = build_r_code(state, run_ctx)
+        session_dir: Optional[Path] = None
+
+        if state.session_backend == "rstudio":
+            session_dir = resolve_session_dir(state)
+            load_session_environment(session_dir)
 
         if run_ctx.append_only:
             print(
@@ -1065,7 +1117,7 @@ def execute_run(state: State, script_dir: Path) -> None:
             print("Generated R code:", file=sys.stderr)
             print(r_code, file=sys.stderr)
 
-        rpc_script = find_rpc_script(script_dir)
+        rpc_script = find_dispatch_script(script_dir, state.session_backend)
         rpc_args = [
             "--code",
             r_code,
@@ -1075,16 +1127,16 @@ def execute_run(state: State, script_dir: Path) -> None:
             state.request_id,
             "--rpc-timeout",
             state.rpc_timeout_seconds,
-            "--session-dir",
-            str(session_dir),
         ]
-        if state.rpostback_bin:
+        if state.session_backend == "rstudio" and session_dir is not None:
+            rpc_args += ["--session-dir", str(session_dir)]
+        if state.session_backend == "rstudio" and state.rpostback_bin:
             rpc_args += ["--rpostback-bin", state.rpostback_bin]
 
         if run_ctx.expect_result:
             Path(run_ctx.out_path).write_text("", encoding="utf-8")
 
-        if not check_session_busy_before_rpc(session_dir):
+        if state.session_backend == "rstudio" and session_dir is not None and not check_session_busy_before_rpc(session_dir):
             raise RunError("Failed busy precheck.")
 
         suppress_stdout = run_ctx.expect_result
@@ -1108,7 +1160,10 @@ def execute_run(state: State, script_dir: Path) -> None:
 
             if not (out_file.exists() and out_file.stat().st_size > 0):
                 print(f"Timed out waiting for result file: {run_ctx.out_path}", file=sys.stderr)
-                diagnose_result_wait_timeout(out_file, session_dir)
+                if state.session_backend == "rstudio" and session_dir is not None:
+                    diagnose_result_wait_timeout_rstudio(out_file, session_dir)
+                else:
+                    diagnose_result_wait_timeout_positron(out_file)
                 raise RunError("Timed out waiting for result file.")
 
         success = True
@@ -1135,9 +1190,9 @@ def print_help() -> None:
         "  <<export>><R expression>      Export expression via saveRDS and return file path\n"
         "  <<create>><name>:=<expr>      Create new variable in .GlobalEnv\n"
         "  <<modify>><R statement>       Evaluate statement in .GlobalEnv\n"
-        "  <<session-dir>><dir>          Override active RStudio session directory\n"
+        "  <<session-dir>><dir>          Override active RStudio session directory (RStudio only)\n"
         "  <<id>><int>                   JSON-RPC request id\n"
-        "  <<rpostback-bin>><path>       Override rpostback binary\n"
+        "  <<rpostback-bin>><path>       Override rpostback binary (RStudio only)\n"
         "  <<out>><path>                 Result output file\n"
         "  <<timeout>><seconds>          Wait timeout for result file\n"
         "  <<rpc-timeout>><seconds>      Hard timeout for run dispatch\n"
@@ -1158,6 +1213,7 @@ def print_help() -> None:
 def show_state(state: State) -> None:
     print(f"  pending capabilities: {pending_capability_count(state)}")
     print("State summary:")
+    print(f"  session backend: {state.session_backend}")
     print(f"  append snippets: {len(state.append_code_snippets)}")
     print(f"  preview set: {bool(state.preview_expr)}")
     print(f"  result set: {bool(state.result_expr)}")
@@ -1268,15 +1324,11 @@ def apply_input_line(state: State, line: str) -> Optional[str]:
     return None
 
 
-def repl() -> int:
-    if len(sys.argv) > 1:
-        script_dir = Path(__file__).resolve().parent
-        return run_low_level_passthrough(sys.argv[1:], script_dir)
-
-    state = State()
+def repl(session_backend: str) -> int:
+    state = State(session_backend=session_backend)
     script_dir = Path(__file__).resolve().parent
 
-    print("interactive_rstudio_bridge ready. Type '<<help>>' for commands.")
+    print(f"talk_to_r ready (backend={session_backend}). Type '<<help>>' for commands.")
     while True:
         try:
             line = input(build_prompt(state))
@@ -1311,4 +1363,5 @@ def repl() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(repl())
+    args = parse_cli_args(sys.argv[1:])
+    sys.exit(repl(args.session))

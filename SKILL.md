@@ -1,25 +1,38 @@
 ---
 name: r-assist
-description: Trigger for prompts where correctness depends on user's live RStudio session state. Rather than asking the user for more context, interrogate the session yourself. Use when a prompt references concrete in-session objects/expressions and asks for current values, levels, labels, dimensions, or concrete failures.
+description: Trigger for prompts where correctness depends on the user's live R session state. Use when a prompt references concrete in-session objects or expressions and asks for current values, levels, labels, dimensions, or concrete failures. If the backend is not explicit, first ask which backend is in use - RStudio or Positron.
 ---
 
 # Assist with R analysis
 
 ## Overview
 
-Interrogate live RStudio session via `python3 SKILL_DIR/scripts/interact_with_rstudio.py` (Convention in this document: `SKILL_DIR` refers to the directory containing this `SKILL.md` file).
+Interrogate the live R session via `python3 SKILL_DIR/scripts/talk_to_r.py` (Convention in this document: `SKILL_DIR` refers to the directory containing this `SKILL.md` file).
 
 ## Workflow
 
-1.  Decide the mode of operation: A, B, or C. Discuss with user if unsure.
-2.  Use `python3 SKILL_DIR/scripts/interact_with_rstudio.py` to start an interactive command-building shell.
-3.  Use your defined capabilities to build the R code.
-4.  Apply appropriate options, then run the code.
-5.  Inspect output and iterate.
-6.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
-7.  Present report. Strongly consider visualizing key arguments.
+1.  Decide the backend first. If it is not explicit, stop and ask `Which backend are you using, RStudio or Positron?`
+2.  Decide the mode of operation: A, B, or C. Discuss with user if unsure.
+3.  Use `python3 SKILL_DIR/scripts/talk_to_r.py --session=<backend>` to start an interactive command-building shell.
+4.  Use your defined capabilities to build the R code.
+5.  Apply appropriate options, then run the code.
+6.  Inspect output and iterate.
+7.  (Mode B) Open a background R session (`R --quiet --no-save`) and continue analysis.
+8.  Present report. Strongly consider visualizing key arguments.
 
-## Step 1. Decide mode of operation
+## Step 1. Decide backend
+
+-   If the prompt explicitly says `Positron` or `RStudio`, take note of that and proceed immediately.
+-   If the prompt only says `live R session` / `current R session` / `R console` and does not identify the backend, ask back before doing anything else: `Which backend are you using, RStudio or Positron?`
+-   Do not guess the backend.
+-   Do not inspect processes, sockets, logs, or window state just to infer the backend. The clarification question is required whenever the backend is ambiguous.
+
+This dictates the option used in later script invocation:
+
+-   Use `--session=rstudio` for RStudio/rsession-backed consoles.
+-   Use `--session=positron` for Positron/ark-backed consoles.
+
+## Step 2. Decide mode of operation
 
 ### Quick reference
 
@@ -27,7 +40,7 @@ Interrogate live RStudio session via `python3 SKILL_DIR/scripts/interact_with_rs
 |---------------|---------------|---------------|---------------|---------------|
 | A | Carry out analysis directly in the live console | Avoids expensive exports | Objects expire. May clutter or block console | One-shot reads/checks |
 | B | Export once, then continue in background R session | Avoids blocking console with long costly analyses | Export may be costly | Experimentation, comparison, sweeps |
-| C | Run unattended long jobs `(references/long_computation.md`) | Preserves progress and resumability for long runs | Requires stricter planning and run management | Overnight runs, large sweeps, heavy integrations |
+| C | Run unattended long jobs (`references/long_computation.md`) | Preserves progress and resumability for long runs | Requires stricter planning and run management | Overnight runs, large sweeps, heavy integrations |
 
 ### Primary concerns
 
@@ -43,10 +56,10 @@ Balance the cost of blocking the console with direct analysis (track A) vs. expo
 
 Before beginning any analysis, absolutely follow these steps:
 
-1.  Identify the minimum objects/functions needed from live RStudio. Build the smallest possible payload expression from live objects in one call (fewest objects possible).
+1.  Identify the minimum objects/functions needed from the live R session. Build the smallest possible payload expression from live objects in one call (fewest objects possible).
 2.  Default to using derived tables, vectors, embeddings, metadata slices, or marker results instead of entire assay objects.
 3.  Explicitly examine data dimensions and flag any large cost-determining magnitudes.
-4.  Use `python3 SKILL_DIR/scripts/estimate_export_seconds.py '<payload>'` to estimate ETA for export.
+4.  Use `python3 SKILL_DIR/scripts/estimate_export_seconds.py --session=<backend> '<payload>'` to estimate ETA for export.
 5.  Expect the most expensive step of your analysis, and run a quick pilot analysis with a small subset of the data. Use `benchmark` option to gather info for estimating ETA of full analysis.
 
 ### Deliberate and discuss
@@ -59,17 +72,18 @@ Sometimes the task clearly belongs to a certain pattern and the optimal choice i
 
 Whenever the choice is not obvious, you must take care to identify the minimum scope of analysis. Report your estimates and discuss the optimal approach with the user.
 
-## Step 2. Begin command-building shell
+## Step 3. Begin command-building shell
 
 -   Define `SKILL_DIR` as the directory containing this `SKILL.md`.
--   Always call `python3 SKILL_DIR/scripts/interact_with_rstudio.py` (expanded to absolute path); never call low-level socket helper scripts directly.
+-   Always call `python3 SKILL_DIR/scripts/talk_to_r.py --session=<backend>` (expanded to absolute path); never call low-level socket helper scripts directly.
 -   In Codex tool calls, run scripts with escalation (`sandbox_permissions=require_escalated`) by default; sandbox execution is a known false-failure mode for `rpostback`/local socket access.
--   For every escalated script call, always provide `prefix_rule=["python3","SKILL_DIR/scripts/interact_with_rstudio.py"]`; never include runtime flags/code in the prefix rule.
+-   For every escalated script call, always provide `prefix_rule=["python3","SKILL_DIR/scripts/talk_to_r.py"]`; never include runtime flags/code in the prefix rule.
 -   For interactive bridge sessions in Codex, use `tty=true` so one persistent session id can be reused with `write_stdin` polling.
 -   Do not use `printf` with pipes or heredoc mode.
--   Keep a single live `interact_with_rstudio.py` exec session per run, poll that same session while in flight, and do not start another process until the prior one returns.
+-   Keep a single live `talk_to_r.py` exec session per run, poll that same session while in flight, and do not start another process until the prior one returns.
+-   Positron backend dependency: `--session=positron` requires `python3` to import `zmq` because it talks directly to the Jupyter ZeroMQ shell channel. On Debian/Ubuntu, install `python3-zmq`.
 
-## Step 3. Write code
+## Step 4. Write code
 
 ### Style guide
 
@@ -89,7 +103,7 @@ Once you are in the interactive command-building shell, you can exert the follow
 | PREVIEW (`<<preview>>EXPR`) | Return a conservative, short summary for one expression | Temporary scratch env (parent = `.GlobalEnv`) | None |
 | APPEND (bare R statement without command prefix) | Stage helper statements. Primary vehicle for adding code | Temporary scratch env | Estimate computational cost and plan ahead |
 | RESULT (`<<result>>EXPR`) | Set one expression value that will be returned this run | Temporary execution scope with global read access | Inspect object size, dimensions, and class; beware serialization |
-| EXPORT (`<<export>>EXPR`) | Persist one payload from live RStudio into a temp RDS file | Temporary local file path | Estimate export time, evaluated and discuss with user |
+| EXPORT (`<<export>>EXPR`) | Persist one payload from the live R session into a temp RDS file | Temporary local file path | Estimate export time, evaluated and discuss with user |
 | CREATE (`<<create>>NAME:=EXPR`) | Create new persistent `.GlobalEnv` binding | Global | Obtain explicit user approval |
 | MODIFY (`<<modify>>STMT`) | Mutate existing persistent state | Global | Double-check even after user approval |
 
@@ -181,7 +195,8 @@ Preferred pattern:
 ```         
 tmp <- vec
 tmp2 <- sapply(tmp, my_func)
-<<result>>tmp2 <<run>>
+<<result>>tmp2
+<<run>>
 ```
 
 ### EXPORT (`<<export>>EXPR`)
@@ -215,17 +230,18 @@ res2 <- RunUMAP(obj)
 
 Use only for explicit user-requested mutation of existing `.GlobalEnv` state.
 
-## Step 4. Apply options and run
+## Step 5. Apply options and run
 
 Options are also set interactively using stdin. Use `<<option-name>>VALUE`.
 
 -   Timeout-related options: set both explicitly on long or uncertain calls. Ttilize `est_seconds` = ETA computed in step 1 if in mode B.
     -   `<<timeout>>SECONDS`: pertains to result-file wait. Should be at least `est_seconds + 90`.
     -   `<<rpc-timeout>>SECONDS`: pertains to run step. Should be at least `est_seconds`.
--   Connection-related options: do not manually overwrite `RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, or `RSTUDIO_SESSION_PID` during normal operation. `interact_with_rstudio.py` already prefers valid live runtime env vars and only falls back to `suspended-session-data/environment_vars` when needed.
-    -   `<<session-dir>>DIR`: Override auto session discovery and target one explicit RStudio session directory.
+-   Connection-related options:
+    -   For `--session=rstudio`, do not manually overwrite `RSTUDIO_SESSION_STREAM`, `RS_PORT_TOKEN`, or `RSTUDIO_SESSION_PID` during normal operation. `talk_to_r.py` already prefers valid live runtime env vars and only falls back to `suspended-session-data/environment_vars` when needed.
+    -   `<<session-dir>>DIR`: Override auto session discovery and target one explicit RStudio session directory. RStudio only.
     -   `<<id>>INT`: Set JSON-RPC request id (mainly for tracing/debugging); default is `1`.
-    -   `<<rpostback-bin>>PATH`: Override `rpostback` binary path for troubleshooting custom/runtime layouts.
+    -   `<<rpostback-bin>>PATH`: Override `rpostback` binary path for troubleshooting custom/runtime layouts. RStudio only.
 -   `<<out>>PATH`: Use a fixed result file path instead of an auto-generated temp file when `<<preview>>`, `<<result>>`, or `<<export>>` is set.
 -   `<<benchmark>>ON|OFF`: Benchmark mode for `<<result>>`; returns elapsed time (not the expression value).
 -   `<<benchmark-unit>>SECONDS|MS`: Unit for benchmark output.
@@ -241,7 +257,7 @@ Finally, `<<run>>` the finished R-code.
 
 -   CAVEAT: `<<quit>>` only terminates the bridge, not the R computation. Treat tool `yield_time_ms` as output polling only, not cancellation.
 
-## Step 5. Interpret output
+## Step 6. Interpret output
 
 Bridge output interpretation:
 
@@ -252,7 +268,7 @@ Bridge output interpretation:
 -   `stdout` can be noisy and non-empty on successful runs (for example from `print(...)`).
 -   Treat parse failures (`__SYNTAX_ERROR__`), RPC failures, and explicit `error` payloads as actual failures.
 
-## Step 6. Working with background sessions (mode B)
+## Step 7. Working with background sessions (mode B)
 
 Example:
 
@@ -275,7 +291,7 @@ Cleanup:
 unlink("/absolute/path/from/state-export")
 ```
 
-## Step 7. Present output
+## Step 8. Present output
 
 Humans comprehend visual patterns much more easily than text or numbers. You are strongly encouraged to think of ways to visually emphasize your most significant findings. APPEND plot calls wrapped with `print(...)` to draw plots directly into the live Rstudio graphics device.
 
