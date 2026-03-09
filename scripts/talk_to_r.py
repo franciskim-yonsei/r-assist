@@ -837,6 +837,50 @@ def check_r_code_parse(r_code: str, expect_result: bool, out_path: str) -> None:
             pass
 
 
+def build_console_trace(state: State) -> str:
+    lines: List[str] = []
+    lines.extend(state.append_code_snippets)
+
+    if state.preview_expr:
+        lines.append(f"# preview: {state.preview_expr}")
+
+    if state.result_expr:
+        if state.benchmark_mode:
+            lines.append(f"# benchmark ({state.benchmark_unit}): {state.result_expr}")
+        else:
+            lines.append(f"# result: {state.result_expr}")
+
+    if state.state_export_expr:
+        lines.append(f"# export: {state.state_export_expr}")
+
+    for spec in state.create_global_specs:
+        lines.append(f"# create: {spec}")
+
+    for snippet in state.modify_global_snippets:
+        lines.append(f"# modify: {snippet}")
+
+    return "\n".join(lines)
+
+
+def write_temp_r_script(r_code: str) -> Path:
+    fd, script_path = tempfile.mkstemp(prefix="codex_talk_to_r_run_", suffix=".R", dir="/tmp")
+    os.close(fd)
+    path = Path(script_path)
+    path.write_text(r_code, encoding="utf-8")
+    return path
+
+
+def build_source_dispatch_code(script_path: Path) -> str:
+    escaped_path = escape_for_r_string(str(script_path))
+    return (
+        f'source("{escaped_path}", '
+        'local = new.env(parent = .GlobalEnv), '
+        'echo = FALSE, '
+        'print.eval = FALSE, '
+        'keep.source = FALSE)'
+    )
+
+
 def build_r_code(state: State, run_ctx: RunContext) -> str:
     r_exec_lines: List[str] = []
     r_create_lines: List[str] = []
@@ -995,8 +1039,13 @@ def build_r_code(state: State, run_ctx: RunContext) -> str:
     out_path_escaped = ""
     if run_ctx.expect_result:
         out_path_escaped = escape_for_r_string(run_ctx.out_path)
+    console_trace_escaped = escape_for_r_string(build_console_trace(state))
 
     r_code = ""
+    r_code += f'.codex_console_trace <- "{console_trace_escaped}"\n'
+    r_code += 'if (nzchar(.codex_console_trace)) {\n'
+    r_code += '  cat(paste0("Codex executed:\\n", .codex_console_trace, "\\n"))\n'
+    r_code += '}\n'
     r_code += f'.codex_append_only <- {"TRUE" if run_ctx.append_only else "FALSE"}\n'
     r_code += f'.codex_result_out_path <- "{out_path_escaped}"\n'
     r_code += '.codex_captured_stdout <- character(0)\n'
@@ -1095,9 +1144,11 @@ def run_rpc_dispatch(rpc_script: Path, rpc_args: List[str], suppress_stdout: boo
 def execute_run(state: State, script_dir: Path) -> None:
     run_ctx = validate_state_for_run(state)
     success = False
+    temp_script_path: Optional[Path] = None
 
     try:
         r_code = build_r_code(state, run_ctx)
+        dispatch_code = ""
         session_dir: Optional[Path] = None
 
         if state.session_backend == "rstudio":
@@ -1112,17 +1163,21 @@ def execute_run(state: State, script_dir: Path) -> None:
             )
 
         check_r_code_parse(r_code, run_ctx.expect_result, run_ctx.out_path)
+        temp_script_path = write_temp_r_script(r_code)
+        dispatch_code = build_source_dispatch_code(temp_script_path)
 
         if state.print_code:
             print("Generated R code:", file=sys.stderr)
             print(r_code, file=sys.stderr)
+            print("Dispatch code:", file=sys.stderr)
+            print(dispatch_code, file=sys.stderr)
 
         rpc_script = find_dispatch_script(script_dir, state.session_backend)
         rpc_args = [
             "--code",
-            r_code,
+            dispatch_code,
             "--isolate-code",
-            "1",
+            "0",
             "--id",
             state.request_id,
             "--rpc-timeout",
@@ -1178,6 +1233,11 @@ def execute_run(state: State, script_dir: Path) -> None:
                 Path(run_ctx.state_export_path).unlink()
             except OSError:
                 pass
+        if temp_script_path is not None:
+            try:
+                temp_script_path.unlink()
+            except OSError:
+                pass
 
 
 def print_help() -> None:
@@ -1198,7 +1258,7 @@ def print_help() -> None:
         "  <<rpc-timeout>><seconds>      Hard timeout for run dispatch\n"
         "  <<benchmark>><ON|OFF>         Benchmark result expression (case-insensitive)\n"
         "  <<benchmark-unit>><SECONDS|MS> Unit for benchmark (case-insensitive)\n"
-        "  <<print-code>><ON|OFF>        Print generated R snippet to stderr (case-insensitive)\n"
+        "  <<print-code>><ON|OFF>        Print generated temp R script + dispatch code to stderr\n"
         "\n"
         "Control:\n"
         "  <<smoke>>                     Run a minimal bridge health check\n"

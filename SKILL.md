@@ -245,7 +245,7 @@ Options are also set interactively using stdin. Use `<<option-name>>VALUE`.
 -   `<<out>>PATH`: Use a fixed result file path instead of an auto-generated temp file when `<<preview>>`, `<<result>>`, or `<<export>>` is set.
 -   `<<benchmark>>ON|OFF`: Benchmark mode for `<<result>>`; returns elapsed time (not the expression value).
 -   `<<benchmark-unit>>SECONDS|MS`: Unit for benchmark output.
--   `<<print-code>>ON|OFF`: Print generated R snippet to stderr before RPC run.
+-   `<<print-code>>ON|OFF`: Print the generated temp R script and one-line dispatch code to stderr before RPC run.
 
 Finally, `<<run>>` the finished R-code.
 
